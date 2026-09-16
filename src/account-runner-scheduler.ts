@@ -1539,6 +1539,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return { accepted: true, admissions };
     }
 
+    // A stopped container can never run its job, so its JIT registration would sit
+    // offline until GitHub's one-day reaper; drop it now.
+    await this.retryRunnerCleanup(job);
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs
        SET status = 'stopped-awaiting-completion', recovery_due_at = ?, updated_at = ?

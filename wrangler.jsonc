@@ -6,7 +6,10 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "observability": {
-    "enabled": true,
+    // Off: the upstream runner image prints a CF_RESOURCE_SAMPLE line every second per container,
+    // which pushed the account into Workers Logs' 1% sampling for every Worker; samples stay in D1.
+    // Debug live with `wrangler tail`. https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits
+    "enabled": false,
   },
   "d1_databases": [
     {

@@ -14,8 +14,8 @@ interface __BaseEnv_Env {
 	RUNNER_IMAGE_BUILDER_IMAGE_NAME: "cloudflare-github-actions-runner-image-builder";
 	RUNNER_IMAGE_BUILDER_BOOTSTRAP_DEPLOYMENT_ID: "unconfigured";
 	RUNNER_IMAGE_NAME: "cloudflare-github-actions-runner-runner";
-	RUNNER_IMAGE_SOURCE_REPOSITORY: "biw/cloudflare-github-actions-runner";
-	RUNNER_IMAGE_SOURCE_REF: "main";
+	RUNNER_IMAGE_SOURCE_REPOSITORY: "voltplot/cloudflare-github-actions-runner";
+	RUNNER_IMAGE_SOURCE_REF: "v1.0.10-voltplot.3";
 	RUNNER_CACHE_ENABLED: "true";
 	RUNNER_CACHE_MAX_BYTES: "100000000000";
 	RUNNER_CACHE_PREFIX: "cloudflare-github-actions-runner";

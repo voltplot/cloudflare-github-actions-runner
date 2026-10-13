@@ -29,6 +29,7 @@ import {
 } from "./setup-validation";
 import {
   assignResourceTraceRunner,
+  deleteExpiredResourceTraces,
   parseResourceTracePayload,
   persistResourceTraceSamples,
   verifyResourceTraceAuthorization,
@@ -646,5 +647,9 @@ export default {
       });
       return json({ error: "Runner scheduling failed" }, 500);
     }
+  },
+
+  async scheduled(_controller: ScheduledController, env: WorkerEnvironment): Promise<void> {
+    await deleteExpiredResourceTraces(env);
   },
 } satisfies ExportedHandler<WorkerEnvironment>;

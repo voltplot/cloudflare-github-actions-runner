@@ -1,5 +1,7 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { defineConfig } from "vite-plus";
+
+const resourceMetricsMigrations = await readD1Migrations("src/migrations");
 
 const toolingIgnorePatterns = [
   ".agent/**",
@@ -96,6 +98,7 @@ export default defineConfig({
         test: {
           include: ["tests/durable/**/*.test.ts"],
           name: "durable",
+          provide: { resourceMetricsMigrations },
           pool: "@cloudflare/vitest-pool-workers",
         },
       },

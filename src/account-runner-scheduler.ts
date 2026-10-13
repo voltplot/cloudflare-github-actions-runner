@@ -1393,14 +1393,13 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
       input.runnerName,
     )[0];
-    const assignedJob = this.job(input.jobId);
+    // No job row is required: GitHub can deliver `in_progress` before `queued`.
+    // https://docs.github.com/en/webhooks/testing-and-troubleshooting-webhooks/troubleshooting-webhooks#webhooks-deliveries-are-out-of-order
     if (
       runner === undefined ||
-      assignedJob === undefined ||
       runner.github_owner.toLowerCase() !== input.target.owner.toLowerCase() ||
       runner.github_repository.toLowerCase() !== input.target.repository.toLowerCase() ||
-      runner.profile_key !== input.profile.key ||
-      !jobMatchesRunnerClaim(assignedJob, input)
+      runner.profile_key !== input.profile.key
     ) {
       return;
     }
@@ -1565,8 +1564,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
     // A one-job runner that GitHub assigned exits when that job ends. GitHub's
     // runner `busy` flag can read false mid-job (actions/runner#4422), so
-    // never ask it about a runner whose assignment was delivered.
-    if (runner.assignment_observed !== 0) {
+    // never ask it about a runner whose assignment was delivered. The
+    // assignment can land while the GitHub requests below are awaited.
+    const assigned = () =>
+      this.rows<JitRunnerRow>(
+        "SELECT * FROM scheduler_jit_runners WHERE runner_name = ? AND assignment_observed = 1",
+        runnerName,
+      ).length !== 0;
+    if (assigned()) {
       return false;
     }
     const target = { owner: source.github_owner, repository: source.github_repository };
@@ -1580,7 +1585,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       "SELECT * FROM scheduler_jobs WHERE runner_name = ? AND status IN ('provisioning', 'running')",
       runnerName,
     )[0];
-    const deregistered = await deregisterIdleGitHubRunner({ ...target, token }, runnerName, ownJob?.job_id);
+    const deregistered =
+      (await deregisterIdleGitHubRunner({ ...target, token }, runnerName, ownJob?.job_id, assigned)) && !assigned();
     if (deregistered) {
       this.recordEvent("idle-runner-deregistered", { jobId: ownJob?.job_id, detail: { runnerName } });
     }

@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type { SchedulerJobInput } from "../../src/account-runner-scheduler";
 import { RUNNER_PROFILES } from "../../src/runner-profiles";
@@ -179,5 +179,70 @@ describe("AccountRunnerScheduler idle runners", () => {
 
     // Asking GitHub would fail here: the test Worker has no GitHub App key.
     await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+  });
+
+  it("keeps a runner whose assignment arrived before its job was queued", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("started-before-queued");
+    const queuedJob = job("700", "cf-standard-3-job-700", "refs/heads/main");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
+    await scheduler.workflowJobStarted({
+      jobId: "701",
+      runnerName: queuedJob.runnerName,
+      runnerId: 7_001,
+      target,
+      profile,
+    });
+
+    await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+  });
+
+  it.each(["GET", "DELETE"])("keeps a runner whose assignment lands during the GitHub %s", async (landsDuring) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName(`assigned-during-${landsDuring}`);
+    // The Worker's legacy repository, whose token the test environment provides.
+    const legacyTarget = { owner: "biw", repository: "cloudflare-github-actions-runner" };
+    const sourceJob = {
+      ...job("800", "cf-standard-3-job-800", "refs/heads/main"),
+      target: legacyTarget,
+      installationId: undefined,
+    };
+    const assignedJob = { ...sourceJob, jobId: "801", runnerName: "cf-standard-3-job-801" };
+
+    await scheduler.submit(sourceJob);
+    await scheduler.submit(assignedJob);
+    await provisionRunner(scheduler, sourceJob.jobId, sourceJob.runnerName, 8_001);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'running', runner_name = 'cf-standard-3-job-799' WHERE job_id = ?",
+        sourceJob.jobId,
+      );
+    });
+
+    const requests: string[] = [];
+    await runInDurableObject(scheduler, async (instance) => {
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+        const method = init?.method ?? "GET";
+        requests.push(method);
+        if (method === landsDuring) {
+          await instance.workflowJobStarted({
+            jobId: assignedJob.jobId,
+            runnerName: sourceJob.runnerName,
+            runnerId: 8_001,
+            target: legacyTarget,
+            profile,
+          });
+        }
+        return method === "DELETE"
+          ? new Response(null, { status: 204 })
+          : Response.json({ runners: [{ id: 8_001, name: sourceJob.runnerName, busy: false }] });
+      });
+      try {
+        await expect(instance.deregisterIdleRunner(sourceJob.runnerName)).resolves.toBe(false);
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+    expect(requests).toEqual(landsDuring === "GET" ? ["GET"] : ["GET", "DELETE"]);
   });
 });

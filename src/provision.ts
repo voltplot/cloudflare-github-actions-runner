@@ -135,14 +135,16 @@ async function githubJson<const Schema extends z.ZodType>(
  * Deregister a runner that has no work, so its Container can be destroyed.
  * Returns false while the job it was started for runs on it or has not
  * started anywhere (GitHub queues a job held by a `concurrency` group before
- * any runner may take it), while GitHub reports the runner busy, or when
- * GitHub refuses the DELETE because the runner holds a job (HTTP 422).
+ * any runner may take it), while GitHub reports the runner busy, when
+ * `assigned` reports an assignment just before the DELETE, or when GitHub
+ * refuses the DELETE because the runner holds a job (HTTP 422).
  * https://docs.github.com/en/rest/actions/self-hosted-runners#delete-a-self-hosted-runner-from-a-repository
  */
 export async function deregisterIdleGitHubRunner(
   credentials: GitHubRunnerCredentials,
   runnerName: string,
   ownJobId: string | undefined,
+  assigned: () => boolean,
   dependencies: ProvisionDependencies = defaultDependencies,
 ): Promise<boolean> {
   if (ownJobId !== undefined) {
@@ -167,7 +169,7 @@ export async function deregisterIdleGitHubRunner(
   if (registration === undefined) {
     return true;
   }
-  if (registration.busy) {
+  if (registration.busy || assigned()) {
     return false;
   }
   const deletion = await deleteGitHubRunner(credentials, registration.id, dependencies);

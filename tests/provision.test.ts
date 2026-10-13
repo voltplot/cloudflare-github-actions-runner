@@ -287,14 +287,18 @@ describe("deregisterIdleGitHubRunner", () => {
   ])("$case", async ({ busy, jobStatus, jobRunner, deleteStatus, deleted, released }) => {
     const fetch = github(busy, jobStatus, jobRunner, deleteStatus);
 
-    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", { fetch })).resolves.toBe(released);
+    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", () => false, { fetch })).resolves.toBe(
+      released,
+    );
     expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(deleted);
   });
 
   it("fails instead of releasing a runner GitHub could not report on", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(null, { status: 502 }));
 
-    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", { fetch })).rejects.toThrow("HTTP 502");
+    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", () => false, { fetch })).rejects.toThrow(
+      "HTTP 502",
+    );
     expect(fetch).toHaveBeenCalledOnce();
   });
 });

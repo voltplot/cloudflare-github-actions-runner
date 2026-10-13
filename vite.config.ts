@@ -86,6 +86,7 @@ export default defineConfig({
           cloudflareTest({
             miniflare: {
               bindings: {
+                GITHUB_RUNNER_TOKEN: "test-runner-token",
                 RUNNER_CACHE_MAX_BYTES: "20",
               },
             },

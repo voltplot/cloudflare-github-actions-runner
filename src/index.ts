@@ -635,6 +635,8 @@ export default {
           target,
           profile: decision.profile,
         });
+        // Before the D1 write: a failed trace write must not drop the displaced job's new runner.
+        ctx.waitUntil(startRunnerProvisioningWorkflows(env, result.admissions));
         if (result.accepted) {
           await assignResourceTraceRunner(env, {
             runnerName: decision.runnerName,
@@ -642,7 +644,6 @@ export default {
             repository: `${target.owner}/${target.repository}`,
           });
         }
-        ctx.waitUntil(startRunnerProvisioningWorkflows(env, result.admissions));
         console.log("Cloudflare runner GitHub assignment observed", {
           jobId: decision.jobId,
           runnerName: decision.runnerName,

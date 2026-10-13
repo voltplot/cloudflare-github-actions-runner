@@ -142,13 +142,16 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
 });
 
 describe("AccountRunnerScheduler idle runners", () => {
-  it("asks GitHub about a runner whose job completed before its JIT record was written", async () => {
+  it("asks GitHub about a runner whose job completed or moved to another runner during provisioning", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-provisioning");
     const queuedJob = job("500", "cf-standard-3-job-500", "refs/heads/main");
 
     await scheduler.submit(queuedJob);
     await runInDurableObject(scheduler, async (_instance, state) => {
-      state.storage.sql.exec("UPDATE scheduler_jobs SET status = 'releasing' WHERE job_id = ?", queuedJob.jobId);
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'releasing', runner_name = 'cf-standard-3-job-499' WHERE job_id = ?",
+        queuedJob.jobId,
+      );
     });
     await scheduler.runnerProvisioned(queuedJob.jobId, queuedJob.runnerName, 5_001);
 

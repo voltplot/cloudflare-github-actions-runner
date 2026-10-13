@@ -1131,12 +1131,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       jobId,
       runnerName,
     );
-    const job = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE job_id = ? AND runner_name = ? AND runner_id = ?",
-      jobId,
-      runnerName,
-      runnerId,
-    )[0];
+    // Record every JIT runner, even one whose job completed or moved to another
+    // runner meanwhile: its Container still starts, and deregisterIdleRunner needs it.
+    const job = this.job(jobId);
     if (job === undefined) {
       return;
     }
@@ -1561,16 +1558,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   /** True once the runner is deregistered and its Container may be destroyed. */
   async deregisterIdleRunner(runnerName: string): Promise<boolean> {
-    // A runner keeps its JIT record after another runner takes its job; a runner
-    // whose job completed during provisioning has only its job row.
     const source = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE job_id = (SELECT source_job_id FROM scheduler_jit_runners WHERE runner_name = ?) OR runner_name = ?`,
-      runnerName,
+      "SELECT * FROM scheduler_jobs WHERE job_id = (SELECT source_job_id FROM scheduler_jit_runners WHERE runner_name = ?)",
       runnerName,
     )[0];
     if (source === undefined) {
-      throw new Error(`No scheduler record names runner ${runnerName}`);
+      throw new Error(`No JIT runner record for ${runnerName}`);
     }
     const target = { owner: source.github_owner, repository: source.github_repository };
     const token = await githubTokenForRunner(this.env, target, source.github_installation_id, (legacyTarget) =>

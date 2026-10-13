@@ -219,6 +219,11 @@ describe("AccountRunnerScheduler stopped runners", () => {
             .toArray(),
         ).toEqual([{ status: "running", runner_name: otherJob.runnerName }]);
         await instance.workflowJobCompleted(sourceJob.jobId);
+        // .5's recovery left cleanup retries on runners that never stopped.
+        state.storage.sql.exec(
+          "UPDATE scheduler_jobs SET runner_cleanup_state = 'retry' WHERE job_id = ?",
+          sourceJob.jobId,
+        );
         state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0, runner_cleanup_due_at = 0");
         await instance.alarm();
       } finally {

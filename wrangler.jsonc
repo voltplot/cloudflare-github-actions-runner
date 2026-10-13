@@ -11,6 +11,10 @@
     // Debug live with `wrangler tail`. https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits
     "enabled": false,
   },
+  // Hourly resource-trace retention (src/resource-traces.ts). https://developers.cloudflare.com/workers/configuration/cron-triggers/
+  "triggers": {
+    "crons": ["17 * * * *"],
+  },
   "d1_databases": [
     {
       "binding": "RESOURCE_METRICS",

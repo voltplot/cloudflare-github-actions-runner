@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 import type { GitHubRepositoryTarget } from "./github-repository";
 import type { ResourceTraceContainerConfiguration } from "./resource-traces";
 import type { RunnerCacheContainerConfiguration } from "./runner-cache";
@@ -107,13 +109,72 @@ export async function deleteGitHubRunner(
   if (response.status === 422) {
     return { kind: "busy" };
   }
-  if (!response.ok) {
-    console.error("Could not remove the JIT runner after container startup failed", {
-      runnerId,
-      status: response.status,
-    });
-  }
+  console.error("Could not remove the JIT runner", { runnerId, status: response.status });
   return { kind: "failed", status: response.status };
+}
+
+const githubRunnerListSchema = z.object({
+  runners: z.array(z.object({ id: z.number().int().positive(), name: z.string(), busy: z.boolean() })),
+});
+const githubJobSchema = z.object({ status: z.string() });
+
+async function githubJson<const Schema extends z.ZodType>(
+  url: string,
+  token: string,
+  schema: Schema,
+  dependencies: ProvisionDependencies,
+): Promise<z.infer<Schema>> {
+  const response = await dependencies.fetch(url, { headers: githubHeaders(token) });
+  if (!response.ok) {
+    throw new Error(`GitHub returned HTTP ${response.status} for ${url}`);
+  }
+  return schema.parse(await response.json());
+}
+
+/**
+ * Deregister a runner that has no work, so its Container can be destroyed.
+ * Returns false while GitHub reports the runner busy, or while the job it was
+ * started for has not started anywhere: GitHub queues a job held by a
+ * `concurrency` group before any runner may take it. A successful DELETE also
+ * closes the race with a new assignment, because GitHub refuses to delete a
+ * runner that holds a job (HTTP 422).
+ * https://docs.github.com/en/rest/actions/self-hosted-runners#delete-a-self-hosted-runner-from-a-repository
+ */
+export async function deregisterIdleGitHubRunner(
+  credentials: GitHubRunnerCredentials,
+  runnerName: string,
+  ownJobId: string | undefined,
+  dependencies: ProvisionDependencies = defaultDependencies,
+): Promise<boolean> {
+  const { runners } = await githubJson(
+    `${githubRunnerUrl(credentials)}?name=${encodeURIComponent(runnerName)}`,
+    credentials.token,
+    githubRunnerListSchema,
+    dependencies,
+  );
+  const registration = runners.find((candidate) => candidate.name === runnerName);
+  if (registration === undefined) {
+    return true;
+  }
+  if (registration.busy) {
+    return false;
+  }
+  if (ownJobId !== undefined) {
+    const job = await githubJson(
+      `https://api.github.com/repos/${encodeURIComponent(credentials.owner)}/${encodeURIComponent(credentials.repository)}/actions/jobs/${encodeURIComponent(ownJobId)}`,
+      credentials.token,
+      githubJobSchema,
+      dependencies,
+    );
+    if (job.status !== "in_progress" && job.status !== "completed") {
+      return false;
+    }
+  }
+  const deletion = await deleteGitHubRunner(credentials, registration.id, dependencies);
+  if (deletion.kind === "failed") {
+    throw new Error(`GitHub returned HTTP ${deletion.status} deleting runner ${registration.id}`);
+  }
+  return deletion.kind !== "busy";
 }
 
 export async function provisionRunner(
@@ -229,4 +290,3 @@ export async function provisionRunner(
     runnerId: jitConfig.runner.id,
   };
 }
-import { z } from "zod";

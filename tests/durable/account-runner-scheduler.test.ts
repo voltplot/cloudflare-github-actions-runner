@@ -162,4 +162,22 @@ describe("AccountRunnerScheduler idle runners", () => {
       );
     });
   });
+
+  it("keeps a runner whose GitHub assignment was delivered without asking GitHub", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("assigned-runner");
+    const queuedJob = job("600", "cf-standard-3-job-600", "refs/heads/main");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 6_001);
+    await scheduler.workflowJobStarted({
+      jobId: queuedJob.jobId,
+      runnerName: queuedJob.runnerName,
+      runnerId: 6_001,
+      target,
+      profile,
+    });
+
+    // Asking GitHub would fail here: the test Worker has no GitHub App key.
+    await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+  });
 });

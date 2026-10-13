@@ -1558,12 +1558,16 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   /** True once the runner is deregistered and its Container may be destroyed. */
   async deregisterIdleRunner(runnerName: string): Promise<boolean> {
-    const source = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE job_id = (SELECT source_job_id FROM scheduler_jit_runners WHERE runner_name = ?)",
-      runnerName,
-    )[0];
-    if (source === undefined) {
+    const runner = this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE runner_name = ?", runnerName)[0];
+    const source = runner === undefined ? undefined : this.job(runner.source_job_id);
+    if (runner === undefined || source === undefined) {
       throw new Error(`No JIT runner record for ${runnerName}`);
+    }
+    // A one-job runner that GitHub assigned exits when that job ends. GitHub's
+    // runner `busy` flag can read false mid-job (actions/runner#4422), so
+    // never ask it about a runner whose assignment was delivered.
+    if (runner.assignment_observed !== 0) {
+      return false;
     }
     const target = { owner: source.github_owner, repository: source.github_repository };
     const token = await githubTokenForRunner(this.env, target, source.github_installation_id, (legacyTarget) =>

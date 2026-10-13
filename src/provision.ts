@@ -116,7 +116,7 @@ export async function deleteGitHubRunner(
 const githubRunnerListSchema = z.object({
   runners: z.array(z.object({ id: z.number().int().positive(), name: z.string(), busy: z.boolean() })),
 });
-const githubJobSchema = z.object({ status: z.string() });
+const githubJobSchema = z.object({ status: z.string(), runner_name: z.string().nullable() });
 
 async function githubJson<const Schema extends z.ZodType>(
   url: string,
@@ -133,11 +133,10 @@ async function githubJson<const Schema extends z.ZodType>(
 
 /**
  * Deregister a runner that has no work, so its Container can be destroyed.
- * Returns false while GitHub reports the runner busy, or while the job it was
- * started for has not started anywhere: GitHub queues a job held by a
- * `concurrency` group before any runner may take it. A successful DELETE also
- * closes the race with a new assignment, because GitHub refuses to delete a
- * runner that holds a job (HTTP 422).
+ * Returns false while the job it was started for runs on it or has not
+ * started anywhere (GitHub queues a job held by a `concurrency` group before
+ * any runner may take it), while GitHub reports the runner busy, or when
+ * GitHub refuses the DELETE because the runner holds a job (HTTP 422).
  * https://docs.github.com/en/rest/actions/self-hosted-runners#delete-a-self-hosted-runner-from-a-repository
  */
 export async function deregisterIdleGitHubRunner(
@@ -146,6 +145,18 @@ export async function deregisterIdleGitHubRunner(
   ownJobId: string | undefined,
   dependencies: ProvisionDependencies = defaultDependencies,
 ): Promise<boolean> {
+  if (ownJobId !== undefined) {
+    const job = await githubJson(
+      `https://api.github.com/repos/${encodeURIComponent(credentials.owner)}/${encodeURIComponent(credentials.repository)}/actions/jobs/${encodeURIComponent(ownJobId)}`,
+      credentials.token,
+      githubJobSchema,
+      dependencies,
+    );
+    const runsHere = job.status === "in_progress" && job.runner_name === runnerName;
+    if (runsHere || (job.status !== "in_progress" && job.status !== "completed")) {
+      return false;
+    }
+  }
   const { runners } = await githubJson(
     `${githubRunnerUrl(credentials)}?name=${encodeURIComponent(runnerName)}`,
     credentials.token,
@@ -158,17 +169,6 @@ export async function deregisterIdleGitHubRunner(
   }
   if (registration.busy) {
     return false;
-  }
-  if (ownJobId !== undefined) {
-    const job = await githubJson(
-      `https://api.github.com/repos/${encodeURIComponent(credentials.owner)}/${encodeURIComponent(credentials.repository)}/actions/jobs/${encodeURIComponent(ownJobId)}`,
-      credentials.token,
-      githubJobSchema,
-      dependencies,
-    );
-    if (job.status !== "in_progress" && job.status !== "completed") {
-      return false;
-    }
   }
   const deletion = await deleteGitHubRunner(credentials, registration.id, dependencies);
   if (deletion.kind === "failed") {

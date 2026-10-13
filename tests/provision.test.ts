@@ -222,7 +222,7 @@ describe("provisionRunner", () => {
 describe("deregisterIdleGitHubRunner", () => {
   const runnerName = "cf-standard-3-job-7";
 
-  function github(busy: boolean, jobStatus: string, deleteStatus: number) {
+  function github(busy: boolean, jobStatus: string, jobRunner: string | null, deleteStatus: number) {
     return vi.fn<typeof globalThis.fetch>(async (input, init) => {
       const url = String(input);
       if (init?.method === "DELETE") {
@@ -232,7 +232,7 @@ describe("deregisterIdleGitHubRunner", () => {
         return Response.json({ total_count: 1, runners: [{ id: 123, name: runnerName, busy }] });
       }
       if (url.endsWith("/actions/jobs/7")) {
-        return Response.json({ status: jobStatus });
+        return Response.json({ status: jobStatus, runner_name: jobRunner });
       }
       throw new Error(`Unexpected GitHub request ${url}`);
     });
@@ -240,9 +240,19 @@ describe("deregisterIdleGitHubRunner", () => {
 
   it.each([
     {
-      case: "keeps a runner that holds a job",
+      case: "keeps a runner GitHub reports busy",
       busy: true,
       jobStatus: "in_progress",
+      jobRunner: "cf-other",
+      deleteStatus: 204,
+      deleted: false,
+      released: false,
+    },
+    {
+      case: "keeps a runner running its own job while GitHub reports it idle",
+      busy: false,
+      jobStatus: "in_progress",
+      jobRunner: runnerName,
       deleteStatus: 204,
       deleted: false,
       released: false,
@@ -251,6 +261,7 @@ describe("deregisterIdleGitHubRunner", () => {
       case: "keeps a runner whose own job waits on a concurrency group",
       busy: false,
       jobStatus: "queued",
+      jobRunner: null,
       deleteStatus: 204,
       deleted: false,
       released: false,
@@ -259,6 +270,7 @@ describe("deregisterIdleGitHubRunner", () => {
       case: "deregisters a runner whose job ran elsewhere",
       busy: false,
       jobStatus: "in_progress",
+      jobRunner: "cf-other",
       deleteStatus: 204,
       deleted: true,
       released: true,
@@ -267,12 +279,13 @@ describe("deregisterIdleGitHubRunner", () => {
       case: "keeps a runner GitHub assigned between the check and the delete",
       busy: false,
       jobStatus: "completed",
+      jobRunner: "cf-other",
       deleteStatus: 422,
       deleted: true,
       released: false,
     },
-  ])("$case", async ({ busy, jobStatus, deleteStatus, deleted, released }) => {
-    const fetch = github(busy, jobStatus, deleteStatus);
+  ])("$case", async ({ busy, jobStatus, jobRunner, deleteStatus, deleted, released }) => {
+    const fetch = github(busy, jobStatus, jobRunner, deleteStatus);
 
     await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", { fetch })).resolves.toBe(released);
     expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(deleted);

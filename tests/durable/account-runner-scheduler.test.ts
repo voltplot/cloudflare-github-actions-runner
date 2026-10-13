@@ -140,3 +140,23 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
   });
 });
+
+describe("AccountRunnerScheduler idle runners", () => {
+  it("asks GitHub about a runner whose job completed before its JIT record was written", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-provisioning");
+    const queuedJob = job("500", "cf-standard-3-job-500", "refs/heads/main");
+
+    await scheduler.submit(queuedJob);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE scheduler_jobs SET status = 'releasing' WHERE job_id = ?", queuedJob.jobId);
+    });
+    await scheduler.runnerProvisioned(queuedJob.jobId, queuedJob.runnerName, 5_001);
+
+    // The test Worker has no GitHub App key, so reaching the token request proves the runner was found.
+    await runInDurableObject(scheduler, async (instance) => {
+      await expect(instance.deregisterIdleRunner(queuedJob.runnerName)).rejects.toThrow(
+        "No GitHub App installation token is available for biw",
+      );
+    });
+  });
+});

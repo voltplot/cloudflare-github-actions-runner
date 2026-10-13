@@ -1561,16 +1561,20 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   /** True once the runner is deregistered and its Container may be destroyed. */
   async deregisterIdleRunner(runnerName: string): Promise<boolean> {
-    const runner = this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE runner_name = ?", runnerName)[0];
-    if (runner === undefined) {
-      throw new Error(`No JIT runner record for ${runnerName}`);
+    // A runner keeps its JIT record after another runner takes its job; a runner
+    // whose job completed during provisioning has only its job row.
+    const source = this.rows<JobRow>(
+      `SELECT * FROM scheduler_jobs
+       WHERE job_id = (SELECT source_job_id FROM scheduler_jit_runners WHERE runner_name = ?) OR runner_name = ?`,
+      runnerName,
+      runnerName,
+    )[0];
+    if (source === undefined) {
+      throw new Error(`No scheduler record names runner ${runnerName}`);
     }
-    const target = { owner: runner.github_owner, repository: runner.github_repository };
-    const token = await githubTokenForRunner(
-      this.env,
-      target,
-      this.job(runner.source_job_id)?.github_installation_id ?? null,
-      (legacyTarget) => githubRunnerTokenFor(this.env, legacyTarget),
+    const target = { owner: source.github_owner, repository: source.github_repository };
+    const token = await githubTokenForRunner(this.env, target, source.github_installation_id, (legacyTarget) =>
+      githubRunnerTokenFor(this.env, legacyTarget),
     );
     if (token === undefined) {
       throw new Error(`No GitHub App installation token is available for ${target.owner}`);

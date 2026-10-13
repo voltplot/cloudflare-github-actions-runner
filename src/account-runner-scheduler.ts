@@ -962,22 +962,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       },
     });
 
-    const earlyRunner = this.rows<JitRunnerRow>(
-      "SELECT * FROM scheduler_jit_runners WHERE assigned_job_id = ? AND assignment_observed = 1",
-      job.jobId,
-    )[0];
-    if (earlyRunner !== undefined) {
-      const started = await this.workflowJobStarted({
-        jobId: job.jobId,
-        runnerName: earlyRunner.runner_name,
-        target: job.target,
-        profile: job.profile,
-      });
-      if (started.accepted) {
-        return { accepted: true, admissions: started.admissions };
-      }
-    }
-
     const admissions = this.admitNext();
     await this.scheduleWorkAlarmIfNeeded();
     const stored = this.job(job.jobId);
@@ -1310,6 +1294,23 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return { accepted: false, admissions: [] };
     }
 
+    if (this.job(input.jobId) === undefined && jobMatchesRunnerClaim(runnerOwner, input)) {
+      // `in_progress` arrived before `queued`. The job shares the runner owner's
+      // repository and profile; its later `queued` delivery fills in the head SHA.
+      const timestamp = now();
+      this.ctx.storage.sql.exec(
+        `INSERT INTO scheduler_jobs
+         (job_id, runner_name, github_owner, github_repository, head_sha, worker_origin, github_installation_id,
+          profile_json, profile_key, vcpu, memory_mib, disk_mb, status, created_at, updated_at)
+         SELECT ?, runner_name, github_owner, github_repository, '', worker_origin, github_installation_id,
+          profile_json, profile_key, vcpu, memory_mib, disk_mb, 'queued', ?, ?
+         FROM scheduler_jobs WHERE job_id = ?`,
+        input.jobId,
+        timestamp,
+        timestamp,
+        runnerOwner.job_id,
+      );
+    }
     const actualJob = this.job(input.jobId);
     if (
       !jobMatchesRunnerClaim(runnerOwner, input) ||
@@ -1611,12 +1612,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   private async retryRunnerCleanup(job: JobRow): Promise<void> {
     const timestamp = now();
-    const runner = this.rows<JitRunnerRow>(
-      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
-      job.runner_name,
-    )[0];
-    const runsAnotherJob = runner?.assignment_observed === 1 && runner.assigned_job_id !== job.job_id;
-    if (job.runner_id === null || runsAnotherJob) {
+    const skip = () => {
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jobs
          SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL
@@ -1624,6 +1620,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         job.job_id,
       );
       this.recordEvent("jit-runner-cleanup-skipped", { jobId: job.job_id, slotId: job.slot_id ?? undefined });
+    };
+    if (job.runner_id === null) {
+      skip();
       return;
     }
 
@@ -1634,6 +1633,16 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       );
       if (token === undefined) {
         throw new Error(`No GitHub App installation token is available for ${target.owner}`);
+      }
+      // Read after the await: a runner that took another job exits after it, and
+      // GitHub accepts a DELETE for a busy runner (actions/runner#4422).
+      const runner = this.rows<JitRunnerRow>(
+        "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
+        job.runner_name,
+      )[0];
+      if (runner?.assignment_observed === 1 && runner.assigned_job_id !== job.job_id) {
+        skip();
+        return;
       }
       const result = await deleteGitHubRunner({ ...target, token }, job.runner_id);
       if (result.kind === "deleted" || result.kind === "not-found") {
@@ -1707,14 +1716,15 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           detail: { runnerId: job.runner_id, stoppedAt: job.container_stopped_at },
         },
       );
-      // eslint-disable-next-line no-await-in-loop -- each deletion is an account-scoped recovery action.
-      await this.retryRunnerCleanup(job);
+      // Release before the awaited cleanup, which can interleave with a reassignment of this job.
       this.releaseJob(
         job,
         awaitingContainerStop ? "completed" : "failed",
         awaitingContainerStop ? undefined : "Container stopped before GitHub reported the job complete",
       );
       admissions.push(...this.admitNext());
+      // eslint-disable-next-line no-await-in-loop -- each deletion is an account-scoped recovery action.
+      await this.retryRunnerCleanup(job);
     }
 
     const cleanupRetries = this.rows<JobRow>(

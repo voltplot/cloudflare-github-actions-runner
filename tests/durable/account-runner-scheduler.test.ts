@@ -181,10 +181,14 @@ describe("AccountRunnerScheduler idle runners", () => {
     await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
   });
 
-  it("keeps a runner whose assignment arrived before its job was queued, then hands it that job", async () => {
+  it("hands a runner the job GitHub started on it before that job was queued", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("started-before-queued");
     const queuedJob = job("700", "cf-standard-3-job-700", "refs/heads/main");
     const earlyJob = job("701", "cf-standard-3-job-701", "refs/heads/main");
+    const runningJobs = () =>
+      runInDurableObject(scheduler, (_instance, state) =>
+        state.storage.sql.exec("SELECT job_id, runner_name FROM scheduler_jobs WHERE status = 'running'").toArray(),
+      );
 
     await scheduler.submit(queuedJob);
     await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
@@ -196,15 +200,10 @@ describe("AccountRunnerScheduler idle runners", () => {
       profile,
     });
 
+    await expect(runningJobs()).resolves.toEqual([{ job_id: earlyJob.jobId, runner_name: queuedJob.runnerName }]);
     await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
-
     await scheduler.submit(earlyJob);
-    await runInDurableObject(scheduler, async (_instance, state) => {
-      const running = state.storage.sql
-        .exec("SELECT job_id, runner_name FROM scheduler_jobs WHERE status = 'running'")
-        .toArray();
-      expect(running).toEqual([{ job_id: earlyJob.jobId, runner_name: queuedJob.runnerName }]);
-    });
+    await expect(runningJobs()).resolves.toEqual([{ job_id: earlyJob.jobId, runner_name: queuedJob.runnerName }]);
   });
 
   it("does not deregister a runner running another job when its source job's completion is recovered", async () => {
@@ -217,18 +216,17 @@ describe("AccountRunnerScheduler idle runners", () => {
 
     await scheduler.submit(sourceJob);
     await provisionRunner(scheduler, sourceJob.jobId, sourceJob.runnerName, 7_501);
-    await scheduler.workflowJobStarted({
-      jobId: "751",
-      runnerName: sourceJob.runnerName,
-      runnerId: 7_501,
-      target: sourceJob.target,
-      profile,
-    });
     await scheduler.workflowJobCompleted(sourceJob.jobId);
 
     const requests: string[] = [];
     await runInDurableObject(scheduler, async (instance, state) => {
       state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", sourceJob.jobId);
+      // The source job ran elsewhere and this runner took job 751; that
+      // assignment can land while recovery awaits its GitHub token.
+      state.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET assigned_job_id = '751', assignment_observed = 1 WHERE runner_name = ?",
+        sourceJob.runnerName,
+      );
       const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
         requests.push(`${init?.method ?? "GET"} ${String(input)}`);
         return new Response(null, { status: 204 });

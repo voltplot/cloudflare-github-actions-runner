@@ -1,5 +1,3 @@
-import { z } from "zod";
-
 import type { GitHubRepositoryTarget } from "./github-repository";
 import type { ResourceTraceContainerConfiguration } from "./resource-traces";
 import type { RunnerCacheContainerConfiguration } from "./runner-cache";
@@ -109,72 +107,31 @@ export async function deleteGitHubRunner(
   if (response.status === 422) {
     return { kind: "busy" };
   }
-  console.error("Could not remove the JIT runner", { runnerId, status: response.status });
+  if (!response.ok) {
+    console.error("Could not remove the JIT runner after container startup failed", {
+      runnerId,
+      status: response.status,
+    });
+  }
   return { kind: "failed", status: response.status };
 }
 
-const githubRunnerListSchema = z.object({
-  runners: z.array(z.object({ id: z.number().int().positive(), name: z.string(), busy: z.boolean() })),
-});
-const githubJobSchema = z.object({ status: z.string(), runner_name: z.string().nullable() });
+const githubJobSchema = z.object({ status: z.string() });
 
-async function githubJson<const Schema extends z.ZodType>(
-  url: string,
-  token: string,
-  schema: Schema,
-  dependencies: ProvisionDependencies,
-): Promise<z.infer<Schema>> {
-  const response = await dependencies.fetch(url, { headers: githubHeaders(token) });
-  if (!response.ok) {
-    throw new Error(`GitHub returned HTTP ${response.status} for ${url}`);
-  }
-  return schema.parse(await response.json());
-}
-
-/**
- * Deregister a runner that has no work, so its Container can be destroyed.
- * Returns false while the job it was started for runs on it or has not
- * started anywhere (GitHub queues a job held by a `concurrency` group before
- * any runner may take it), while GitHub reports the runner busy, or when
- * GitHub refuses the DELETE because the runner holds a job (HTTP 422).
- * https://docs.github.com/en/rest/actions/self-hosted-runners#delete-a-self-hosted-runner-from-a-repository
- */
-export async function deregisterIdleGitHubRunner(
+/** https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run */
+export async function githubJobStatus(
   credentials: GitHubRunnerCredentials,
-  runnerName: string,
-  ownJobId: string | undefined,
+  jobId: string,
   dependencies: ProvisionDependencies = defaultDependencies,
-): Promise<boolean> {
-  if (ownJobId !== undefined) {
-    const job = await githubJson(
-      `https://api.github.com/repos/${encodeURIComponent(credentials.owner)}/${encodeURIComponent(credentials.repository)}/actions/jobs/${encodeURIComponent(ownJobId)}`,
-      credentials.token,
-      githubJobSchema,
-      dependencies,
-    );
-    const runsHere = job.status === "in_progress" && job.runner_name === runnerName;
-    if (runsHere || (job.status !== "in_progress" && job.status !== "completed")) {
-      return false;
-    }
-  }
-  const { runners } = await githubJson(
-    `${githubRunnerUrl(credentials)}?name=${encodeURIComponent(runnerName)}`,
-    credentials.token,
-    githubRunnerListSchema,
-    dependencies,
+): Promise<string> {
+  const response = await dependencies.fetch(
+    `https://api.github.com/repos/${encodeURIComponent(credentials.owner)}/${encodeURIComponent(credentials.repository)}/actions/jobs/${encodeURIComponent(jobId)}`,
+    { headers: githubHeaders(credentials.token) },
   );
-  const registration = runners.find((candidate) => candidate.name === runnerName);
-  if (registration === undefined) {
-    return true;
+  if (!response.ok) {
+    throw new Error(`GitHub returned HTTP ${response.status} for job ${jobId}`);
   }
-  if (registration.busy) {
-    return false;
-  }
-  const deletion = await deleteGitHubRunner(credentials, registration.id, dependencies);
-  if (deletion.kind === "failed") {
-    throw new Error(`GitHub returned HTTP ${deletion.status} deleting runner ${registration.id}`);
-  }
-  return deletion.kind !== "busy";
+  return githubJobSchema.parse(await response.json()).status;
 }
 
 export async function provisionRunner(
@@ -290,3 +247,4 @@ export async function provisionRunner(
     runnerId: jitConfig.runner.id,
   };
 }
+import { z } from "zod";

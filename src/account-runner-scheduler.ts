@@ -5,7 +5,7 @@ import { prepareRunnerApplication, reconcileRunnerApplicationCapacity } from "./
 import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
 import { githubTokenForRunner } from "./github-app";
-import { deleteGitHubRunner, deregisterIdleGitHubRunner } from "./provision";
+import { deleteGitHubRunner, githubJobStatus } from "./provision";
 import {
   runnerProfileSchema,
   RUNNER_PROFILE_KEYS,
@@ -1132,7 +1132,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       runnerName,
     );
     // Record every JIT runner, even one whose job completed or moved to another
-    // runner meanwhile: its Container still starts, and deregisterIdleRunner needs it.
+    // runner meanwhile: its Container still starts and may take another job.
     const job = this.job(jobId);
     if (job === undefined) {
       return;
@@ -1340,21 +1340,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
 
     const timestamp = now();
-    const retryAttempt = runnerOwner.runner_attempt + 1;
-    const retryRunnerName = `${runnerOwner.runner_name.replace(/-r\d+$/u, "")}-r${retryAttempt}`;
-
-    this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET status = 'queued', runner_name = ?, runner_attempt = ?, slot_id = NULL, runner_id = NULL,
-           failure_reason = ?, container_stopped_at = NULL, container_exit_code = NULL,
-           container_stop_reason = NULL, recovery_due_at = NULL, runner_cleanup_state = 'none',
-           runner_cleanup_due_at = NULL, github_assignment_observed = 0, updated_at = ?
-       WHERE job_id = ?`,
-      retryRunnerName,
-      retryAttempt,
+    const { retryAttempt, retryRunnerName } = this.requeueWithFreshRunner(
+      runnerOwner,
       `JIT runner ${input.runnerName} was assigned to GitHub job ${input.jobId}; retrying with a fresh runner`,
-      timestamp,
-      runnerOwner.job_id,
     );
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs
@@ -1412,6 +1400,26 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       now(),
       input.runnerName,
     );
+  }
+
+  /** Send a job back through admission under a fresh JIT runner name; the caller owns its old reservation. */
+  private requeueWithFreshRunner(job: JobRow, reason: string) {
+    const retryAttempt = job.runner_attempt + 1;
+    const retryRunnerName = `${job.runner_name.replace(/-r\d+$/u, "")}-r${retryAttempt}`;
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_jobs
+       SET status = 'queued', runner_name = ?, runner_attempt = ?, slot_id = NULL, runner_id = NULL,
+           failure_reason = ?, container_stopped_at = NULL, container_exit_code = NULL,
+           container_stop_reason = NULL, recovery_due_at = NULL, runner_cleanup_state = 'none',
+           runner_cleanup_due_at = NULL, github_assignment_observed = 0, updated_at = ?
+       WHERE job_id = ?`,
+      retryRunnerName,
+      retryAttempt,
+      reason,
+      now(),
+      job.job_id,
+    );
+    return { retryAttempt, retryRunnerName };
   }
 
   private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
@@ -1536,9 +1544,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return { accepted: true, admissions };
     }
 
-    // A stopped container can never run its job, so its JIT registration would sit
-    // offline until GitHub's one-day reaper; drop it now.
-    await this.retryRunnerCleanup(job);
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs
        SET status = 'stopped-awaiting-completion', recovery_due_at = ?, updated_at = ?
@@ -1552,44 +1557,22 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       slotId: job.slot_id ?? undefined,
       detail: { recoveryDueAt: timestamp + RUNNER_COMPLETION_GRACE_MS },
     });
+    // A stopped container can never run its job, so its JIT registration would sit
+    // offline until GitHub's one-day reaper; drop it now. This is the only place
+    // the Worker deregisters a runner: here its Container has provably stopped.
+    await this.retryRunnerCleanup(this.job(job.job_id) ?? job);
     await this.scheduleWorkAlarmIfNeeded();
     return { accepted: true, admissions: [] };
   }
 
-  /** True once the runner is deregistered and its Container may be destroyed. */
-  async deregisterIdleRunner(runnerName: string): Promise<boolean> {
-    const runner = this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE runner_name = ?", runnerName)[0];
-    const source = runner === undefined ? undefined : this.job(runner.source_job_id);
-    if (runner === undefined || source === undefined) {
-      throw new Error(`No JIT runner record for ${runnerName}`);
-    }
-    // A one-job runner that GitHub assigned exits when that job ends. GitHub's
-    // runner `busy` flag can read false mid-job (actions/runner#4422), so
-    // never ask it about a runner whose assignment was delivered.
-    if (runner.assignment_observed !== 0) {
-      return false;
-    }
-    const target = { owner: source.github_owner, repository: source.github_repository };
-    const token = await githubTokenForRunner(this.env, target, source.github_installation_id, (legacyTarget) =>
-      githubRunnerTokenFor(this.env, legacyTarget),
-    );
-    if (token === undefined) {
-      throw new Error(`No GitHub App installation token is available for ${target.owner}`);
-    }
-    const ownJob = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE runner_name = ? AND status IN ('provisioning', 'running')",
-      runnerName,
-    )[0];
-    const deregistered = await deregisterIdleGitHubRunner({ ...target, token }, runnerName, ownJob?.job_id);
-    if (deregistered) {
-      this.recordEvent("idle-runner-deregistered", { jobId: ownJob?.job_id, detail: { runnerName } });
-    }
-    return deregistered;
-  }
-
+  /**
+   * Delete a stopped runner's registration; a runner without a recorded stop is
+   * never deleted. A job may move to another runner during the GitHub calls, so
+   * results are recorded only while the job still names this runner.
+   */
   private async retryRunnerCleanup(job: JobRow): Promise<void> {
     const timestamp = now();
-    if (job.runner_id === null) {
+    if (job.runner_id === null || job.container_stopped_at === null) {
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jobs
          SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL
@@ -1614,8 +1597,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           `UPDATE scheduler_jobs
            SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL,
                runner_cleanup_attempts = runner_cleanup_attempts + 1
-           WHERE job_id = ?`,
+           WHERE job_id = ? AND runner_id = ?`,
           job.job_id,
+          job.runner_id,
         );
         this.recordEvent("jit-runner-cleanup-complete", {
           jobId: job.job_id,
@@ -1629,9 +1613,10 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         `UPDATE scheduler_jobs
          SET runner_cleanup_state = 'retry', runner_cleanup_due_at = ?,
              runner_cleanup_attempts = runner_cleanup_attempts + 1
-         WHERE job_id = ?`,
+         WHERE job_id = ? AND runner_id = ?`,
         timestamp + RUNNER_CLEANUP_RETRY_MS,
         job.job_id,
+        job.runner_id,
       );
       this.recordEvent("jit-runner-cleanup-retry", {
         jobId: job.job_id,
@@ -1643,9 +1628,10 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         `UPDATE scheduler_jobs
          SET runner_cleanup_state = 'retry', runner_cleanup_due_at = ?,
              runner_cleanup_attempts = runner_cleanup_attempts + 1
-         WHERE job_id = ?`,
+         WHERE job_id = ? AND runner_id = ?`,
         timestamp + RUNNER_CLEANUP_RETRY_MS,
         job.job_id,
+        job.runner_id,
       );
       this.recordEvent("jit-runner-cleanup-retry", {
         jobId: job.job_id,
@@ -1670,7 +1656,13 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       timestamp,
     );
     const admissions: SchedulerAdmission[] = [];
-    for (const job of stoppedJobs) {
+    for (const candidate of stoppedJobs) {
+      // eslint-disable-next-line no-await-in-loop -- each GitHub read is an account-scoped recovery action.
+      const job = await this.jobStillUnstarted(candidate);
+      if (job === undefined) {
+        admissions.push(...this.admitNext());
+        continue;
+      }
       const awaitingContainerStop = job.status === "releasing";
       this.recordEvent(
         awaitingContainerStop ? "container-stop-missing-recovery-started" : "container-stop-recovery-started",
@@ -1680,8 +1672,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           detail: { runnerId: job.runner_id, stoppedAt: job.container_stopped_at },
         },
       );
-      // eslint-disable-next-line no-await-in-loop -- each deletion is an account-scoped recovery action.
-      await this.retryRunnerCleanup(job);
       this.releaseJob(
         job,
         awaitingContainerStop ? "completed" : "failed",
@@ -1703,6 +1693,77 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       await this.retryRunnerCleanup(job);
     }
     return admissions;
+  }
+
+  /**
+   * Its runner exits two minutes after connecting when no job reached it, for
+   * example while the job waits on a `concurrency` group. If GitHub still has
+   * that job waiting, give it a fresh runner once the stopped runner is
+   * deregistered, and return undefined. Otherwise return the current row for
+   * release, or undefined when it changed meanwhile or must be retried.
+   */
+  private async jobStillUnstarted(candidate: JobRow): Promise<JobRow | undefined> {
+    const unchanged = (): JobRow | undefined => {
+      const current = this.job(candidate.job_id);
+      return current?.status === candidate.status && current.runner_name === candidate.runner_name
+        ? current
+        : undefined;
+    };
+    const retryLater = (retryAt: number, reason: string): undefined => {
+      this.ctx.storage.sql.exec(
+        `UPDATE scheduler_jobs SET recovery_due_at = ?
+         WHERE job_id = ? AND status = 'stopped-awaiting-completion' AND runner_name = ?`,
+        retryAt,
+        candidate.job_id,
+        candidate.runner_name,
+      );
+      this.recordEvent("container-stop-recovery-retry", { jobId: candidate.job_id, detail: { reason, retryAt } });
+      return undefined;
+    };
+    let job = unchanged();
+    if (job?.status !== "stopped-awaiting-completion") {
+      return job;
+    }
+    // A Worker deployment can interrupt runnerStopped before its deregistration.
+    if (job.runner_cleanup_state === "none") {
+      await this.retryRunnerCleanup(job);
+      job = unchanged();
+    }
+    if (job === undefined || job.github_assignment_observed !== 0) {
+      return job;
+    }
+    let status: string;
+    try {
+      const target = { owner: job.github_owner, repository: job.github_repository };
+      const token = await githubTokenForRunner(this.env, target, job.github_installation_id, (legacyTarget) =>
+        githubRunnerTokenFor(this.env, legacyTarget),
+      );
+      if (token === undefined) {
+        throw new Error(`No GitHub App installation token is available for ${target.owner}`);
+      }
+      status = await githubJobStatus({ ...target, token }, job.job_id);
+    } catch (error) {
+      return retryLater(now() + RUNNER_COMPLETION_GRACE_MS, error instanceof Error ? error.message : String(error));
+    }
+    const current = unchanged();
+    if (current === undefined || status === "in_progress" || status === "completed") {
+      return current;
+    }
+    if (current.runner_cleanup_state === "retry") {
+      // Requeueing forgets the stopped runner's ID, so deregister it first.
+      return retryLater(
+        Math.max(now(), current.runner_cleanup_due_at ?? 0) + RUNNER_COMPLETION_GRACE_MS,
+        "waiting for runner cleanup",
+      );
+    }
+    const reason = `JIT runner ${current.runner_name} exited before GitHub gave it job ${current.job_id}; retrying with a fresh runner`;
+    this.releaseJob(current, "failed", reason);
+    const { retryRunnerName, retryAttempt } = this.requeueWithFreshRunner(current, reason);
+    this.recordEvent("github-job-requeued-after-idle-runner", {
+      jobId: current.job_id,
+      detail: { runnerName: retryRunnerName, githubStatus: status, retryAttempt },
+    });
+    return undefined;
   }
 
   /**

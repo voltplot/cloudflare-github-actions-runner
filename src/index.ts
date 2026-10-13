@@ -165,10 +165,6 @@ function json<const Body>(body: Body, status = 200): Response {
 }
 
 abstract class GitHubActionsRunnerContainer extends Container<WorkerEnvironment> {
-  // A runner never receives requests, so this timer is not idleness: it is how
-  // often onActivityExpired asks GitHub whether the runner still has work.
-  // https://developers.cloudflare.com/containers/platform-details/architecture/
-  sleepAfter = "2m";
   enableInternet = true;
 
   private runnerName(): string | undefined {
@@ -196,25 +192,13 @@ abstract class GitHubActionsRunnerContainer extends Container<WorkerEnvironment>
     console.log("Cloudflare GitHub Actions runner stopped", { runnerName, exitCode, reason });
   }
 
-  /** A JIT runner exits after its one job; this destroys runners that never get one. */
-  override async onActivityExpired(): Promise<void> {
-    const runnerName = this.runnerName();
-    if (runnerName === undefined) {
-      await super.onActivityExpired();
-      return;
-    }
-    try {
-      if (await this.env.RUNNER_SCHEDULER.getByName(this.env.CLOUDFLARE_ACCOUNT_ID).deregisterIdleRunner(runnerName)) {
-        await this.destroy();
-      }
-    } catch (error) {
-      // Keep the runner: it may hold a job. The next expiry asks again.
-      console.error("Could not check whether the Cloudflare runner is idle", {
-        runnerName,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
+  /**
+   * A runner never receives requests, so expiry is not idleness. The runner
+   * exits on its own after its one job, or two minutes after connecting if no
+   * job reached it (docker/actions-runner-idle-exit.patch); stopping it here
+   * could drop a job GitHub just handed it.
+   */
+  override async onActivityExpired(): Promise<void> {}
 
   override onError(cause: unknown): never {
     console.error("Cloudflare GitHub Actions runner failed to start", {

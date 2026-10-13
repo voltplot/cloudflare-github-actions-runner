@@ -14,8 +14,8 @@ RUN apt-get update \
 WORKDIR /opt/actions-runner-source
 RUN git clone --depth 1 --branch "v${RUNNER_VERSION}" https://github.com/actions/runner.git . \
   && test "$(git rev-parse HEAD)" = "${RUNNER_SOURCE_REVISION}"
-COPY docker/actions-runner-results-proxy.patch /tmp/actions-runner-results-proxy.patch
-RUN git apply /tmp/actions-runner-results-proxy.patch \
+COPY docker/actions-runner-results-proxy.patch docker/actions-runner-idle-exit.patch /tmp/
+RUN git apply /tmp/actions-runner-results-proxy.patch /tmp/actions-runner-idle-exit.patch \
   && cd src \
   && ./dev.sh layout Release
 

@@ -1,0 +1,91 @@
+diff --git a/src/Runner.Listener/BrokerMessageListener.cs b/src/Runner.Listener/BrokerMessageListener.cs
+index cfea82f..ad3a83e 100644
+--- a/src/Runner.Listener/BrokerMessageListener.cs
++++ b/src/Runner.Listener/BrokerMessageListener.cs
+@@ -258,6 +258,10 @@ namespace GitHub.Runner.Listener
+             }
+         }
+ 
++        private Func<bool> _idleExpired = () => false;
++
++        public void SetIdleExitCheck(Func<bool> idleExpired) => _idleExpired = idleExpired;
++
+         public void OnJobStatus(object sender, JobStatusEventArgs e)
+         {
+             Trace.Info("Received job status event. JobState: {0}", e.Status);
+@@ -282,6 +286,10 @@ namespace GitHub.Runner.Listener
+ 
+             while (true)
+             {
++                if (_idleExpired())
++                {
++                    return null;
++                }
+                 TaskAgentMessage message = null;
+                 _getMessagesTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
+                 try
+diff --git a/src/Runner.Listener/MessageListener.cs b/src/Runner.Listener/MessageListener.cs
+index ef06dd1..dc6a839 100644
+--- a/src/Runner.Listener/MessageListener.cs
++++ b/src/Runner.Listener/MessageListener.cs
+@@ -36,6 +36,9 @@ namespace GitHub.Runner.Listener
+ 
+         Task RefreshListenerTokenAsync();
+         void OnJobStatus(object sender, JobStatusEventArgs e);
++
++        // Checked only between polls; when it holds, GetNextMessageAsync returns null.
++        void SetIdleExitCheck(Func<bool> idleExpired);
+     }
+ 
+     public sealed class MessageListener : RunnerService, IMessageListener
+@@ -215,6 +218,10 @@ namespace GitHub.Runner.Listener
+             }
+         }
+ 
++        private Func<bool> _idleExpired = () => false;
++
++        public void SetIdleExitCheck(Func<bool> idleExpired) => _idleExpired = idleExpired;
++
+         public void OnJobStatus(object sender, JobStatusEventArgs e)
+         {
+             Trace.Info("Received job status event. JobState: {0}", e.Status);
+@@ -243,6 +250,10 @@ namespace GitHub.Runner.Listener
+             heartbeat.Restart();
+             while (true)
+             {
++                if (_idleExpired())
++                {
++                    return null;
++                }
+                 token.ThrowIfCancellationRequested();
+                 TaskAgentMessage message = null;
+                 _getMessagesTokenSource = CancellationTokenSource.CreateLinkedTokenSource(token);
+diff --git a/src/Runner.Listener/Runner.cs b/src/Runner.Listener/Runner.cs
+index 31c8713..36ed76f 100644
+--- a/src/Runner.Listener/Runner.cs
++++ b/src/Runner.Listener/Runner.cs
+@@ -512,6 +512,12 @@ namespace GitHub.Runner.Listener
+ 
+                     jobDispatcher.JobStatus += _listener.OnJobStatus;
+ 
++                    // Cloudflare: a one-job runner that no job reaches within two minutes
++                    // exits between long polls, so it never drops a job the broker handed it.
++                    // https://github.com/actions/runner/pull/4461
++                    var idleExitAt = DateTime.UtcNow.AddMinutes(2);
++                    _listener.SetIdleExitCheck(() => runOnce && !runOnceJobReceived && DateTime.UtcNow >= idleExitAt);
++
+                     while (!HostContext.RunnerShutdownToken.IsCancellationRequested)
+                     {
+                         // Check if we need to restart the session and can do so (job dispatcher not busy)
+@@ -604,6 +610,11 @@ namespace GitHub.Runner.Listener
+                             }
+ 
+                             message = await getNextMessage; //get next message
++                            if (message == null)
++                            {
++                                _term.WriteLine($"{DateTime.UtcNow:u}: No job arrived within two minutes; exiting.");
++                                return Constants.Runner.ReturnCode.Success;
++                            }
+                             HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
+                             if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                             {

@@ -1,5 +1,5 @@
 import { env, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import type { SchedulerJobInput } from "../../src/account-runner-scheduler";
 import { RUNNER_PROFILES } from "../../src/runner-profiles";
@@ -141,43 +141,95 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
   });
 });
 
-describe("AccountRunnerScheduler idle runners", () => {
-  it("asks GitHub about a runner whose job completed or moved to another runner during provisioning", async () => {
-    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-provisioning");
-    const queuedJob = job("500", "cf-standard-3-job-500", "refs/heads/main");
+describe("AccountRunnerScheduler stopped runners", () => {
+  // The Worker's legacy repository, whose token the test environment provides.
+  const legacyTarget = { owner: "biw", repository: "cloudflare-github-actions-runner" };
+  const legacyJob = (jobId: string): SchedulerJobInput => ({
+    ...job(jobId, `cf-standard-3-job-${jobId}`, "refs/heads/main"),
+    target: legacyTarget,
+    installationId: undefined,
+  });
 
-    await scheduler.submit(queuedJob);
-    await runInDurableObject(scheduler, async (_instance, state) => {
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET status = 'releasing', runner_name = 'cf-standard-3-job-499' WHERE job_id = ?",
-        queuedJob.jobId,
-      );
-    });
-    await scheduler.runnerProvisioned(queuedJob.jobId, queuedJob.runnerName, 5_001);
+  it("gives a fresh runner to a job GitHub still has queued after its runner exits idle", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("idle-exit-requeue");
+    const heldJob = legacyJob("900");
 
-    // The test Worker has no GitHub App key, so reaching the token request proves the runner was found.
-    await runInDurableObject(scheduler, async (instance) => {
-      await expect(instance.deregisterIdleRunner(queuedJob.runnerName)).rejects.toThrow(
-        "No GitHub App installation token is available for biw",
-      );
+    await scheduler.submit(heldJob);
+    await provisionRunner(scheduler, heldJob.jobId, heldJob.runnerName, 9_001);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (_input, init) =>
+          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
+        );
+      try {
+        await instance.runnerStopped(heldJob.runnerName, { exitCode: 0, reason: "exit" });
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", heldJob.jobId);
+        await instance.alarm();
+      } finally {
+        fetch.mockRestore();
+      }
+      const [row] = state.storage.sql
+        .exec<{ status: string; runner_name: string }>(
+          "SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?",
+          heldJob.jobId,
+        )
+        .toArray();
+      expect(row).toMatchObject({ runner_name: `${heldJob.runnerName}-r2` });
+      expect(["queued", "admitted"]).toContain(row?.status);
     });
   });
 
-  it("keeps a runner whose GitHub assignment was delivered without asking GitHub", async () => {
-    const scheduler = env.RUNNER_SCHEDULER.getByName("assigned-runner");
-    const queuedJob = job("600", "cf-standard-3-job-600", "refs/heads/main");
+  it("deregisters only the runner whose Container stopped", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("stopped-runner-only");
+    const sourceJob = legacyJob("1000");
+    const otherJob = legacyJob("1001");
 
-    await scheduler.submit(queuedJob);
-    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 6_001);
-    await scheduler.workflowJobStarted({
-      jobId: queuedJob.jobId,
-      runnerName: queuedJob.runnerName,
-      runnerId: 6_001,
-      target,
-      profile,
+    await scheduler.submit(sourceJob);
+    await scheduler.submit(otherJob);
+    await provisionRunner(scheduler, sourceJob.jobId, sourceJob.runnerName, 10_001);
+    await provisionRunner(scheduler, otherJob.jobId, otherJob.runnerName, 10_002);
+
+    const deletes: string[] = [];
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        if (init?.method !== "DELETE") {
+          return Response.json({ status: "completed" });
+        }
+        deletes.push(String(input).split("/").at(-1) ?? "");
+        if (deletes.length === 1) {
+          // GitHub gives the source job to the other, live runner while the
+          // stopped runner's deregistration is in flight, and that fails.
+          await instance.workflowJobStarted({
+            jobId: sourceJob.jobId,
+            runnerName: otherJob.runnerName,
+            runnerId: 10_002,
+            target: legacyTarget,
+            profile,
+          });
+          return new Response(null, { status: 500 });
+        }
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await instance.runnerStopped(sourceJob.runnerName, { exitCode: 0, reason: "exit" });
+        expect(
+          state.storage.sql
+            .exec("SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?", sourceJob.jobId)
+            .toArray(),
+        ).toEqual([{ status: "running", runner_name: otherJob.runnerName }]);
+        await instance.workflowJobCompleted(sourceJob.jobId);
+        // .5's recovery left cleanup retries on runners that never stopped.
+        state.storage.sql.exec(
+          "UPDATE scheduler_jobs SET runner_cleanup_state = 'retry' WHERE job_id = ?",
+          sourceJob.jobId,
+        );
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0, runner_cleanup_due_at = 0");
+        await instance.alarm();
+      } finally {
+        fetch.mockRestore();
+      }
     });
-
-    // Asking GitHub would fail here: the test Worker has no GitHub App key.
-    await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+    expect(deletes).toEqual(["10001"]);
   });
 });

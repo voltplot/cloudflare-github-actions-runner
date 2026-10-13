@@ -8,6 +8,7 @@ import { parseGitHubRepositoryTarget, type GitHubRepositoryTarget } from "./gith
 export const RUNNER_IMAGE_INPUT_PATHS = [
   "docker/Dockerfile",
   "docker/actions-runner-results-proxy.patch",
+  "docker/actions-runner-idle-exit.patch",
   "docker/start-runner.sh",
   "docker/invalid-runner-hook.sh",
   "docker/job-started-hook.sh",

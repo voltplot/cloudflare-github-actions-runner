@@ -181,14 +181,15 @@ describe("AccountRunnerScheduler idle runners", () => {
     await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
   });
 
-  it("keeps a runner whose assignment arrived before its job was queued", async () => {
+  it("keeps a runner whose assignment arrived before its job was queued, then hands it that job", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("started-before-queued");
     const queuedJob = job("700", "cf-standard-3-job-700", "refs/heads/main");
+    const earlyJob = job("701", "cf-standard-3-job-701", "refs/heads/main");
 
     await scheduler.submit(queuedJob);
     await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 7_001);
     await scheduler.workflowJobStarted({
-      jobId: "701",
+      jobId: earlyJob.jobId,
       runnerName: queuedJob.runnerName,
       runnerId: 7_001,
       target,
@@ -196,6 +197,49 @@ describe("AccountRunnerScheduler idle runners", () => {
     });
 
     await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+
+    await scheduler.submit(earlyJob);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      const running = state.storage.sql
+        .exec("SELECT job_id, runner_name FROM scheduler_jobs WHERE status = 'running'")
+        .toArray();
+      expect(running).toEqual([{ job_id: earlyJob.jobId, runner_name: queuedJob.runnerName }]);
+    });
+  });
+
+  it("does not deregister a runner running another job when its source job's completion is recovered", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("recovery-of-reassigned-runner");
+    const sourceJob = {
+      ...job("750", "cf-standard-3-job-750", "refs/heads/main"),
+      target: { owner: "biw", repository: "cloudflare-github-actions-runner" },
+      installationId: undefined,
+    };
+
+    await scheduler.submit(sourceJob);
+    await provisionRunner(scheduler, sourceJob.jobId, sourceJob.runnerName, 7_501);
+    await scheduler.workflowJobStarted({
+      jobId: "751",
+      runnerName: sourceJob.runnerName,
+      runnerId: 7_501,
+      target: sourceJob.target,
+      profile,
+    });
+    await scheduler.workflowJobCompleted(sourceJob.jobId);
+
+    const requests: string[] = [];
+    await runInDurableObject(scheduler, async (instance, state) => {
+      state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", sourceJob.jobId);
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        requests.push(`${init?.method ?? "GET"} ${String(input)}`);
+        return new Response(null, { status: 204 });
+      });
+      try {
+        await instance.alarm();
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+    expect(requests.filter((request) => request.startsWith("DELETE"))).toEqual([]);
   });
 
   it.each(["GET", "DELETE"])("keeps a runner whose assignment lands during the GitHub %s", async (landsDuring) => {

@@ -962,6 +962,22 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       },
     });
 
+    const earlyRunner = this.rows<JitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE assigned_job_id = ? AND assignment_observed = 1",
+      job.jobId,
+    )[0];
+    if (earlyRunner !== undefined) {
+      const started = await this.workflowJobStarted({
+        jobId: job.jobId,
+        runnerName: earlyRunner.runner_name,
+        target: job.target,
+        profile: job.profile,
+      });
+      if (started.accepted) {
+        return { accepted: true, admissions: started.admissions };
+      }
+    }
+
     const admissions = this.admitNext();
     await this.scheduleWorkAlarmIfNeeded();
     const stored = this.job(job.jobId);
@@ -1595,7 +1611,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   private async retryRunnerCleanup(job: JobRow): Promise<void> {
     const timestamp = now();
-    if (job.runner_id === null) {
+    const runner = this.rows<JitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
+      job.runner_name,
+    )[0];
+    const runsAnotherJob = runner?.assignment_observed === 1 && runner.assigned_job_id !== job.job_id;
+    if (job.runner_id === null || runsAnotherJob) {
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jobs
          SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL

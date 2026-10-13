@@ -534,8 +534,10 @@ describe("Cloudflare custom Container configuration", () => {
       configuration: { ...configuration(), image: targetImage },
       health: { instances: { active: 0 } },
     };
+    // Another product's application, listed without a configuration.
+    const foreign = { id: "agent-runtime-id", name: "agent-runtime", max_instances: null };
     const deps = dependencies(
-      response([deployed]),
+      response([deployed, foreign]),
       response([deployed]),
       response([{ ...rollout("completed"), target_configuration: { ...configuration(), image: targetImage } }]),
     );

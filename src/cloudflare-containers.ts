@@ -363,19 +363,26 @@ function applicationHasLiveInstances(application: ContainerApplication): boolean
   return ["active", "starting", "scheduling"].some((status) => (instances[status] ?? 0) > 0);
 }
 
-async function listApplications(
+/**
+ * The account can hold other products' applications whose list entries omit
+ * the configuration runner applications always carry, so validate only ours.
+ */
+async function listRunnerApplications(
   env: ContainersApiEnvironment,
   dependencies: ContainersApiDependencies,
 ): Promise<ContainerApplication[]> {
   const result = await containersApiRequest(env, "/applications?per_page=100", { method: "GET" }, dependencies);
-  const applications = z.array(containerApplicationSchema).safeParse(result);
+  const listed = z.array(z.looseObject({ name: z.string() })).safeParse(result);
+  const applications = z
+    .array(containerApplicationSchema)
+    .safeParse(listed.data?.filter((application) => runnerApplication(env, application)));
   if (!applications.success) {
     throw new CloudflareContainersApiError("Cloudflare returned an invalid Container application list", 502);
   }
   return applications.data;
 }
 
-function runnerApplication(env: ContainersApiEnvironment, application: ContainerApplication): boolean {
+function runnerApplication(env: ContainersApiEnvironment, application: { name: string }): boolean {
   if (env.RUNNER_APPLICATION_PREFIX === undefined) {
     return false;
   }
@@ -394,9 +401,7 @@ export async function runnerApplicationImageRolloutsAreActive(
   env: ContainersApiEnvironment,
   dependencies: ContainersApiDependencies = defaultDependencies,
 ): Promise<boolean> {
-  const applications = (await listApplications(env, dependencies)).filter((application) =>
-    runnerApplication(env, application),
-  );
+  const applications = await listRunnerApplications(env, dependencies);
   for (const application of applications) {
     // eslint-disable-next-line no-await-in-loop -- each account application has an independent rollout history.
     const rollouts = await listRollouts(env, application.id, dependencies);
@@ -452,9 +457,7 @@ export async function rolloutRunnerApplicationImages(
   dependencies: ContainersApiDependencies = defaultDependencies,
   options: RolloutRunnerApplicationImagesOptions = {},
 ): Promise<RolloutRunnerApplicationImagesResult> {
-  const applications = (await listApplications(env, dependencies)).filter((application) =>
-    runnerApplication(env, application),
-  );
+  const applications = await listRunnerApplications(env, dependencies);
   const updatedApplications: string[] = [];
   const skippedApplications: string[] = [];
   const reportProgress = async (progress: RunnerApplicationImageRolloutProgress): Promise<void> => {

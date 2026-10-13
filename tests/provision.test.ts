@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import {
   deleteGitHubRunner,
+  deregisterIdleGitHubRunner,
   provisionRunner,
   type GitHubRunnerEnvironment,
   type RunnerContainer,
@@ -215,5 +216,85 @@ describe("provisionRunner", () => {
     const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(null, { status: 422 }));
 
     await expect(deleteGitHubRunner(credentials, 123, { fetch })).resolves.toEqual({ kind: "busy" });
+  });
+});
+
+describe("deregisterIdleGitHubRunner", () => {
+  const runnerName = "cf-standard-3-job-7";
+
+  function github(busy: boolean, jobStatus: string, jobRunner: string | null, deleteStatus: number) {
+    return vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const url = String(input);
+      if (init?.method === "DELETE") {
+        return new Response(null, { status: deleteStatus });
+      }
+      if (url.endsWith(`/actions/runners?name=${runnerName}`)) {
+        return Response.json({ total_count: 1, runners: [{ id: 123, name: runnerName, busy }] });
+      }
+      if (url.endsWith("/actions/jobs/7")) {
+        return Response.json({ status: jobStatus, runner_name: jobRunner });
+      }
+      throw new Error(`Unexpected GitHub request ${url}`);
+    });
+  }
+
+  it.each([
+    {
+      case: "keeps a runner GitHub reports busy",
+      busy: true,
+      jobStatus: "in_progress",
+      jobRunner: "cf-other",
+      deleteStatus: 204,
+      deleted: false,
+      released: false,
+    },
+    {
+      case: "keeps a runner running its own job while GitHub reports it idle",
+      busy: false,
+      jobStatus: "in_progress",
+      jobRunner: runnerName,
+      deleteStatus: 204,
+      deleted: false,
+      released: false,
+    },
+    {
+      case: "keeps a runner whose own job waits on a concurrency group",
+      busy: false,
+      jobStatus: "queued",
+      jobRunner: null,
+      deleteStatus: 204,
+      deleted: false,
+      released: false,
+    },
+    {
+      case: "deregisters a runner whose job ran elsewhere",
+      busy: false,
+      jobStatus: "in_progress",
+      jobRunner: "cf-other",
+      deleteStatus: 204,
+      deleted: true,
+      released: true,
+    },
+    {
+      case: "keeps a runner GitHub assigned between the check and the delete",
+      busy: false,
+      jobStatus: "completed",
+      jobRunner: "cf-other",
+      deleteStatus: 422,
+      deleted: true,
+      released: false,
+    },
+  ])("$case", async ({ busy, jobStatus, jobRunner, deleteStatus, deleted, released }) => {
+    const fetch = github(busy, jobStatus, jobRunner, deleteStatus);
+
+    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", { fetch })).resolves.toBe(released);
+    expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(deleted);
+  });
+
+  it("fails instead of releasing a runner GitHub could not report on", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(new Response(null, { status: 502 }));
+
+    await expect(deregisterIdleGitHubRunner(credentials, runnerName, "7", { fetch })).rejects.toThrow("HTTP 502");
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });

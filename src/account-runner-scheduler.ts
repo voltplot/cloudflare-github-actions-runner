@@ -5,7 +5,7 @@ import { prepareRunnerApplication, reconcileRunnerApplicationCapacity } from "./
 import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
 import { githubTokenForRunner } from "./github-app";
-import { deleteGitHubRunner } from "./provision";
+import { deleteGitHubRunner, deregisterIdleGitHubRunner } from "./provision";
 import {
   runnerProfileSchema,
   RUNNER_PROFILE_KEYS,
@@ -1131,12 +1131,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       jobId,
       runnerName,
     );
-    const job = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE job_id = ? AND runner_name = ? AND runner_id = ?",
-      jobId,
-      runnerName,
-      runnerId,
-    )[0];
+    // Record every JIT runner, even one whose job completed or moved to another
+    // runner meanwhile: its Container still starts, and deregisterIdleRunner needs it.
+    const job = this.job(jobId);
     if (job === undefined) {
       return;
     }
@@ -1557,6 +1554,37 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     });
     await this.scheduleWorkAlarmIfNeeded();
     return { accepted: true, admissions: [] };
+  }
+
+  /** True once the runner is deregistered and its Container may be destroyed. */
+  async deregisterIdleRunner(runnerName: string): Promise<boolean> {
+    const runner = this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE runner_name = ?", runnerName)[0];
+    const source = runner === undefined ? undefined : this.job(runner.source_job_id);
+    if (runner === undefined || source === undefined) {
+      throw new Error(`No JIT runner record for ${runnerName}`);
+    }
+    // A one-job runner that GitHub assigned exits when that job ends. GitHub's
+    // runner `busy` flag can read false mid-job (actions/runner#4422), so
+    // never ask it about a runner whose assignment was delivered.
+    if (runner.assignment_observed !== 0) {
+      return false;
+    }
+    const target = { owner: source.github_owner, repository: source.github_repository };
+    const token = await githubTokenForRunner(this.env, target, source.github_installation_id, (legacyTarget) =>
+      githubRunnerTokenFor(this.env, legacyTarget),
+    );
+    if (token === undefined) {
+      throw new Error(`No GitHub App installation token is available for ${target.owner}`);
+    }
+    const ownJob = this.rows<JobRow>(
+      "SELECT * FROM scheduler_jobs WHERE runner_name = ? AND status IN ('provisioning', 'running')",
+      runnerName,
+    )[0];
+    const deregistered = await deregisterIdleGitHubRunner({ ...target, token }, runnerName, ownJob?.job_id);
+    if (deregistered) {
+      this.recordEvent("idle-runner-deregistered", { jobId: ownJob?.job_id, detail: { runnerName } });
+    }
+    return deregistered;
   }
 
   private async retryRunnerCleanup(job: JobRow): Promise<void> {

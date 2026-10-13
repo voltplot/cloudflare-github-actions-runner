@@ -140,3 +140,44 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
   });
 });
+
+describe("AccountRunnerScheduler idle runners", () => {
+  it("asks GitHub about a runner whose job completed or moved to another runner during provisioning", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-provisioning");
+    const queuedJob = job("500", "cf-standard-3-job-500", "refs/heads/main");
+
+    await scheduler.submit(queuedJob);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'releasing', runner_name = 'cf-standard-3-job-499' WHERE job_id = ?",
+        queuedJob.jobId,
+      );
+    });
+    await scheduler.runnerProvisioned(queuedJob.jobId, queuedJob.runnerName, 5_001);
+
+    // The test Worker has no GitHub App key, so reaching the token request proves the runner was found.
+    await runInDurableObject(scheduler, async (instance) => {
+      await expect(instance.deregisterIdleRunner(queuedJob.runnerName)).rejects.toThrow(
+        "No GitHub App installation token is available for biw",
+      );
+    });
+  });
+
+  it("keeps a runner whose GitHub assignment was delivered without asking GitHub", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("assigned-runner");
+    const queuedJob = job("600", "cf-standard-3-job-600", "refs/heads/main");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 6_001);
+    await scheduler.workflowJobStarted({
+      jobId: queuedJob.jobId,
+      runnerName: queuedJob.runnerName,
+      runnerId: 6_001,
+      target,
+      profile,
+    });
+
+    // Asking GitHub would fail here: the test Worker has no GitHub App key.
+    await expect(scheduler.deregisterIdleRunner(queuedJob.runnerName)).resolves.toBe(false);
+  });
+});

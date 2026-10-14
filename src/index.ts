@@ -639,6 +639,18 @@ export default {
 
       const result = await scheduler.workflowJobCompleted(decision.jobId);
       ctx.waitUntil(startRunnerProvisioningWorkflows(env, result.admissions));
+      // Retention rides on job completions because Cron Triggers never fired for this Worker.
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await deleteExpiredResourceTraces(env);
+          } catch (error) {
+            console.warn("Could not delete expired resource traces", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })(),
+      );
       console.log("Cloudflare runner job completed", { jobId: decision.jobId });
       return json({ accepted: result.accepted }, 202);
     } catch (error) {
@@ -647,9 +659,5 @@ export default {
       });
       return json({ error: "Runner scheduling failed" }, 500);
     }
-  },
-
-  async scheduled(_controller: ScheduledController, env: WorkerEnvironment): Promise<void> {
-    await deleteExpiredResourceTraces(env);
   },
 } satisfies ExportedHandler<WorkerEnvironment>;

@@ -438,6 +438,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       );
       CREATE INDEX IF NOT EXISTS scheduler_jit_runners_assignment
         ON scheduler_jit_runners(assigned_job_id, assignment_observed, updated_at);
+      CREATE TABLE IF NOT EXISTS scheduler_migrations (version INTEGER PRIMARY KEY);
     `);
 
     this.addColumns("scheduler_slots", [
@@ -486,7 +487,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private addColumns(
-    table: "scheduler_slots" | "scheduler_jobs",
+    table: "scheduler_slots" | "scheduler_jobs" | "scheduler_jit_runners",
     migrations: readonly (readonly [string, string])[],
   ): void {
     const columns = new Set(this.rows<{ name: string }>(`PRAGMA table_info(${table})`).map((column) => column.name));
@@ -498,22 +499,19 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private initializeRunnerReservations(): void {
-    const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jit_runners)");
-    if (!columns.some((column) => column.name === "provisioning_deadline")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_jit_runners ADD COLUMN provisioning_deadline INTEGER NOT NULL DEFAULT 0",
-      );
-      this.ctx.storage.sql.exec(
-        "UPDATE scheduler_jit_runners SET provisioning_deadline = updated_at + ?",
-        RUNNER_PROVISIONING_TIMEOUT_MS,
-      );
-    }
-    if (columns.some((column) => column.name === "reserved")) {
+    // Durable Object SQLite disallows PRAGMA user_version; persist versions in SQL instead.
+    // https://github.com/cloudflare/workerd/blob/v1.20260811.1/src/workerd/util/sqlite.c%2B%2B#L513-L539
+    const version = this.ctx.storage.sql
+      .exec<{ version: number | null }>("SELECT MAX(version) AS version FROM scheduler_migrations")
+      .one().version;
+    if ((version ?? 0) >= 1) {
       return;
     }
-    const migrations = [
+    const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jit_runners)");
+    this.addColumns("scheduler_jit_runners", [
+      ["provisioning_deadline", "INTEGER NOT NULL DEFAULT 0"],
       ["slot_id", "TEXT NOT NULL DEFAULT ''"],
-      ["reserved", "INTEGER NOT NULL DEFAULT 1"],
+      ["reserved", "INTEGER NOT NULL DEFAULT 0"],
       ["runner_id", "INTEGER"],
       ["github_installation_id", "INTEGER"],
       ["container_stopped_at", "INTEGER"],
@@ -522,15 +520,18 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["runner_cleanup_state", "TEXT NOT NULL DEFAULT 'none'"],
       ["runner_cleanup_due_at", "INTEGER"],
       ["runner_cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"],
-    ] as const;
-    for (const [name, definition] of migrations) {
-      this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jit_runners ADD COLUMN ${name} ${definition}`);
+    ]);
+    if (!columns.some((column) => column.name === "provisioning_deadline")) {
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET provisioning_deadline = updated_at + ?",
+        RUNNER_PROVISIONING_TIMEOUT_MS,
+      );
     }
+    this.ctx.storage.sql.exec("UPDATE scheduler_jit_runners SET reserved = 0");
     // Legacy assignments can overwrite the source job's runner identity.
-    for (const runner of this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners")) {
+    for (const runner of this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE slot_id = ''")) {
       const source = this.job(runner.source_job_id);
       if (source === undefined) {
-        this.releaseLegacyRunnerReservation(runner.runner_name, "missing-source-job");
         continue;
       }
       const creation = this.rows<{ slot_id: string | null; runner_id: number | null }>(
@@ -548,19 +549,18 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         (sameRunner ? source.slot_id : null) ??
         (RUNNER_PROFILE_KEYS.some((key) => key === runner.profile_key) ? `preset:${runner.profile_key}` : null);
       if (slotId === null || this.slot(slotId) === undefined) {
-        this.releaseLegacyRunnerReservation(runner.runner_name, "missing-slot");
         continue;
       }
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jit_runners
-         SET slot_id = ?, runner_id = ?, github_installation_id = ?, reserved = ?,
+         SET slot_id = ?, runner_id = ?, github_installation_id = ?, provisioning_deadline = ?,
              container_stopped_at = ?, container_exit_code = ?, container_stop_reason = ?,
              runner_cleanup_state = ?, runner_cleanup_due_at = ?, runner_cleanup_attempts = ?
          WHERE runner_name = ?`,
         slotId,
         runnerId,
         source.github_installation_id,
-        stoppedAt === null ? 1 : 0,
+        runner.updated_at + RUNNER_PROVISIONING_TIMEOUT_MS,
         stoppedAt,
         sameRunner ? source.container_exit_code : null,
         sameRunner ? source.container_stop_reason : null,
@@ -576,11 +576,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     )) {
       this.reserveRunner(job, job.slot_id ?? "");
     }
-  }
-
-  private releaseLegacyRunnerReservation(runnerName: string, reason: string): void {
-    this.ctx.storage.sql.exec("UPDATE scheduler_jit_runners SET reserved = 0 WHERE runner_name = ?", runnerName);
-    this.recordEvent("legacy-runner-reservation-released", { detail: { runnerName, reason } });
+    this.reconcileSlotReservations(true);
+    const unreservedCount = this.ctx.storage.sql
+      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM scheduler_jit_runners WHERE reserved = 0")
+      .one().count;
+    if (unreservedCount > 0) {
+      this.recordEvent("legacy-runner-reservations-initialized", { detail: { unreservedCount } });
+    }
+    this.ctx.storage.sql.exec("INSERT INTO scheduler_migrations (version) VALUES (1)");
   }
 
   private initializeSlots(): void {
@@ -680,10 +683,11 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   private reserveRunner(job: JobRow, slotId: string): void {
     this.ctx.storage.sql.exec(
-      `INSERT OR IGNORE INTO scheduler_jit_runners
-       (runner_name, source_job_id, github_owner, github_repository, profile_key, slot_id,
+      `INSERT INTO scheduler_jit_runners
+       (runner_name, source_job_id, github_owner, github_repository, profile_key, slot_id, reserved,
         github_installation_id, created_at, updated_at, provisioning_deadline)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+       ON CONFLICT(runner_name) DO UPDATE SET reserved = 1, slot_id = excluded.slot_id`,
       job.runner_name,
       job.job_id,
       job.github_owner,
@@ -1615,7 +1619,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     });
   }
 
-  private reconcileSlotReservations(): void {
+  private reconcileSlotReservations(resetDesiredCapacity = false): void {
     const slots = this.rows<SlotRow>("SELECT * FROM scheduler_slots");
     for (const slot of slots) {
       const reservedCount =
@@ -1625,13 +1629,19 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          WHERE slot_id = ? AND reserved = 1`,
           slot.slot_id,
         )[0]?.count ?? 0;
-      if (reservedCount === slot.reserved_count) {
+      const desiredMaxInstances = Math.max(
+        resetDesiredCapacity
+          ? Math.min(slot.applied_max_instances, slot.desired_max_instances)
+          : slot.desired_max_instances,
+        reservedCount,
+      );
+      if (reservedCount === slot.reserved_count && desiredMaxInstances === slot.desired_max_instances) {
         continue;
       }
       this.ctx.storage.sql.exec(
-        "UPDATE scheduler_slots SET reserved_count = ?, desired_max_instances = MAX(desired_max_instances, ?) WHERE slot_id = ?",
+        "UPDATE scheduler_slots SET reserved_count = ?, desired_max_instances = ? WHERE slot_id = ?",
         reservedCount,
-        reservedCount,
+        desiredMaxInstances,
         slot.slot_id,
       );
       this.recordEvent("reservation-count-reconciled", {

@@ -270,10 +270,6 @@ export interface SchedulerStatus {
   }>;
 }
 
-function now(): number {
-  return Date.now();
-}
-
 function customApplicationName(env: WorkerEnvironment, slotNumber: number): string {
   return slotNumber === 1 ? env.CUSTOM_RUNNER_APPLICATION : `${env.CUSTOM_RUNNER_APPLICATION}-${slotNumber}`;
 }
@@ -322,11 +318,15 @@ function isSlotConfigurationState(value: string): value is SlotConfigurationStat
   return value === "ready" || value === "configuring" || value === "idle";
 }
 
-function jobMatchesRunnerClaim(job: JobRow, input: SchedulerRunnerClaimInput): boolean {
+function matchesRunner(
+  row: Pick<JobRow, "github_owner" | "github_repository" | "profile_key">,
+  target: GitHubRepositoryTarget,
+  profileKey: string,
+): boolean {
   return (
-    job.github_owner.toLowerCase() === input.target.owner.toLowerCase() &&
-    job.github_repository.toLowerCase() === input.target.repository.toLowerCase() &&
-    job.profile_key === input.profile.key
+    row.github_owner.toLowerCase() === target.owner.toLowerCase() &&
+    row.github_repository.toLowerCase() === target.repository.toLowerCase() &&
+    row.profile_key === profileKey
   );
 }
 
@@ -684,7 +684,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       options.slotId ?? null,
       kind,
       options.detail === undefined ? null : JSON.stringify(options.detail),
-      now(),
+      Date.now(),
     );
   }
 
@@ -716,9 +716,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       job.profile_key,
       slotId,
       job.github_installation_id,
-      now(),
-      now(),
-      now() + RUNNER_PROVISIONING_TIMEOUT_MS,
+      Date.now(),
+      Date.now(),
+      Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
     );
   }
 
@@ -753,10 +753,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       capacityUpdateInProgress: slot.capacity_update_in_progress !== 0,
       lastReleasedAt: slot.last_released_at,
     }));
-  }
-
-  private configuredResources(): ResourceTotals {
-    return configuredCapacity(this.configuredCapacitySlots());
   }
 
   private capacityPlan(
@@ -901,7 +897,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return [];
     }
 
-    const timestamp = now();
+    const timestamp = Date.now();
     this.scheduleCapacityReclamation(capacityPlan.reductions, timestamp);
     const nextGeneration = selected.slot.capacity_generation + 1;
     const configuring = selected.requiresConfiguration || selected.slot.configuration_state === "configuring";
@@ -1007,11 +1003,11 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          WHERE container_stopped_at IS NOT NULL AND runner_cleanup_state = 'none'
        )`,
     )[0];
-    const recoveryDue = (work?.count ?? 0) > 0 ? now() + SCHEDULER_ALARM_DELAY_MS : undefined;
+    const recoveryDue = (work?.count ?? 0) > 0 ? Date.now() + SCHEDULER_ALARM_DELAY_MS : undefined;
     const scheduledDue = [capacityChange?.earliest_due, recovery?.earliest_due, recoveryDue].filter(
       (due): due is number => due !== null && due !== undefined,
     );
-    const nextAlarm = scheduledDue.length === 0 ? undefined : Math.max(now(), Math.min(...scheduledDue));
+    const nextAlarm = scheduledDue.length === 0 ? undefined : Math.max(Date.now(), Math.min(...scheduledDue));
     if (nextAlarm !== undefined) {
       await this.ctx.storage.setAlarm(nextAlarm);
     }
@@ -1030,7 +1026,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return { accepted: true, queueReason: this.queueReason(existing), admissions: [] };
     }
 
-    const timestamp = now();
+    const timestamp = Date.now();
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduler_jobs
        (job_id, runner_name, github_owner, github_repository, head_sha, worker_origin, github_installation_id, cache_scope, cache_fallback_scope, cache_write_allowed, profile_json, profile_key, vcpu, memory_mib, disk_mb, status,
@@ -1110,12 +1106,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       }
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_jobs SET status = 'provisioning', updated_at = ? WHERE job_id = ?",
-        now(),
+        Date.now(),
         jobId,
       );
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_jit_runners SET provisioning_deadline = ? WHERE runner_name = ? AND reserved = 1",
-        now() + RUNNER_PROVISIONING_TIMEOUT_MS,
+        Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
         job.runner_name,
       );
       return this.provisioningPlan(job, slot);
@@ -1214,14 +1210,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     );
     this.ctx.storage.sql.exec(
       "UPDATE capacity_operations SET state = 'applied', updated_at = ? WHERE slot_id = ? AND generation = ?",
-      now(),
+      Date.now(),
       slotId,
       generation,
     );
     this.ctx.storage.sql.exec(
       `UPDATE capacity_operations SET state = 'superseded', updated_at = ?
        WHERE slot_id = ? AND generation < ? AND state = 'pending'`,
-      now(),
+      Date.now(),
       slotId,
       generation,
     );
@@ -1243,8 +1239,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     this.ctx.storage.sql.exec(
       "UPDATE scheduler_jit_runners SET runner_id = ?, updated_at = ?, provisioning_deadline = ? WHERE runner_name = ?",
       runnerId,
-      now(),
-      now() + RUNNER_PROVISIONING_TIMEOUT_MS,
+      Date.now(),
+      Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
       runnerName,
     );
     this.recordEvent("jit-runner-created", { jobId, slotId: runner.slot_id, detail: { runnerId, runnerName } });
@@ -1284,9 +1280,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       const assignedJob = this.job(runner.assigned_job_id);
       if (
         assignedJob !== undefined &&
-        assignedJob.github_owner.toLowerCase() === owner.toLowerCase() &&
-        assignedJob.github_repository.toLowerCase() === repo.toLowerCase() &&
-        assignedJob.profile_key === runner.profile_key &&
+        matchesRunner(assignedJob, { owner, repository: repo }, runner.profile_key) &&
         assignedJob.cache_scope !== ""
       ) {
         return {
@@ -1315,10 +1309,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       runner.reserved === 0 ||
       runner.container_stopped_at !== null ||
       job === undefined ||
-      runner.github_owner.toLowerCase() !== input.target.owner.toLowerCase() ||
-      runner.github_repository.toLowerCase() !== input.target.repository.toLowerCase() ||
-      runner.profile_key !== input.profile.key ||
-      !jobMatchesRunnerClaim(job, input)
+      !matchesRunner(runner, input.target, input.profile.key) ||
+      !matchesRunner(job, input.target, input.profile.key)
     ) {
       return { accepted: false, admissions: [] };
     }
@@ -1326,14 +1318,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       `UPDATE scheduler_jit_runners SET assigned_job_id = ?, assignment_observed = 1, updated_at = ?
        WHERE runner_name = ?`,
       input.jobId,
-      now(),
+      Date.now(),
       input.runnerName,
     );
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs SET status = CASE WHEN status IN ('completed', 'cancelled', 'failed') THEN status ELSE 'running' END,
          github_assignment_observed = 1, recovery_due_at = NULL,
          updated_at = ? WHERE job_id = ?`,
-      now(),
+      Date.now(),
       input.jobId,
     );
     this.recordEvent("github-job-started", {
@@ -1365,7 +1357,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
        configuration_state = CASE WHEN reserved_count = 1 AND configuration_state = 'configuring' THEN 'idle' ELSE configuration_state END,
        configuration_owner_job_id = CASE WHEN reserved_count = 1 AND configuration_state = 'configuring' THEN NULL ELSE configuration_owner_job_id END
        WHERE slot_id = ?`,
-      now(),
+      Date.now(),
       runner.slot_id,
     );
     this.recordEvent("scheduler-released", {
@@ -1379,7 +1371,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs SET status = ?, updated_at = ?, failure_reason = ?, recovery_due_at = NULL WHERE job_id = ?`,
       status,
-      now(),
+      Date.now(),
       reason ?? null,
       job.job_id,
     );
@@ -1423,9 +1415,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       const assigned = this.runner(runnerName);
       if (
         assigned !== undefined &&
-        assigned.github_owner.toLowerCase() === job.github_owner.toLowerCase() &&
-        assigned.github_repository.toLowerCase() === job.github_repository.toLowerCase() &&
-        assigned.profile_key === job.profile_key &&
+        matchesRunner(assigned, { owner: job.github_owner, repository: job.github_repository }, job.profile_key) &&
         (assigned.assigned_job_id === null || assigned.assigned_job_id === jobId)
       ) {
         this.ctx.storage.sql.exec(
@@ -1480,7 +1470,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if ((await this.runtimeState(runner, 0)) === "stopped") {
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_jit_runners SET container_stopped_at = ?, container_stop_reason = 'retired-before-start' WHERE runner_name = ?",
-        now(),
+        Date.now(),
         runnerName,
       );
       this.releaseRunner(runner);
@@ -1511,7 +1501,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (runner === undefined || runner.container_stopped_at !== null) {
       return { accepted: false, admissions: [] };
     }
-    const timestamp = now();
+    const timestamp = Date.now();
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jit_runners SET container_stopped_at = ?, container_exit_code = ?,
          container_stop_reason = ?, updated_at = ? WHERE runner_name = ?`,
@@ -1571,7 +1561,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     } catch (error) {
       retryReason = error instanceof Error ? error.message : String(error);
     }
-    const retryAt = retryReason === undefined ? null : now() + RUNNER_CLEANUP_RETRY_MS;
+    const retryAt = retryReason === undefined ? null : Date.now() + RUNNER_CLEANUP_RETRY_MS;
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jit_runners SET runner_cleanup_state = ?, runner_cleanup_due_at = ?,
          runner_cleanup_attempts = runner_cleanup_attempts + 1 WHERE runner_name = ? AND runner_id IS ?`,
@@ -1588,7 +1578,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private async recoverStoppedRunners(): Promise<SchedulerAdmission[]> {
-    const timestamp = now();
+    const timestamp = Date.now();
     const cleanups = this.rows<StoppedJitRunnerRow>(
       `SELECT * FROM scheduler_jit_runners WHERE container_stopped_at IS NOT NULL
        AND (runner_cleanup_state = 'none' OR (runner_cleanup_state = 'retry' AND runner_cleanup_due_at <= ?))`,
@@ -1624,7 +1614,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     } catch (error) {
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jobs SET recovery_due_at = ? WHERE job_id = ? AND status = 'stopped-awaiting-completion' AND runner_name = ?`,
-        now() + RUNNER_COMPLETION_GRACE_MS,
+        Date.now() + RUNNER_COMPLETION_GRACE_MS,
         candidate.job_id,
         candidate.runner_name,
       );
@@ -1657,7 +1647,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       retryRunnerName,
       retryAttempt,
       reason,
-      now(),
+      Date.now(),
       job.job_id,
     );
 
@@ -1703,7 +1693,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          AND pending_memory_mib IS NOT NULL
          AND pending_disk_mb IS NOT NULL`,
     );
-    const timestamp = now();
+    const timestamp = Date.now();
     for (const slot of configuringSlots) {
       const plan = planConfiguredCapacity(
         this.configuredCapacitySlots(),
@@ -1737,7 +1727,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private recoverStalledCapacityUpdates(): void {
-    const timestamp = now();
+    const timestamp = Date.now();
     const inProgressSlots = this.rows<SlotRow>("SELECT * FROM scheduler_slots WHERE capacity_update_in_progress != 0");
     for (const slot of inProgressSlots) {
       const operation = this.rows<{ target_max_instances: number; updated_at: number }>(
@@ -1773,7 +1763,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   private async applyScheduledCapacityUpdates(): Promise<SchedulerAdmission[]> {
     this.recoverStalledCapacityUpdates();
-    const timestamp = now();
+    const timestamp = Date.now();
     const dueSlots = this.rows<SlotRow>(
       `SELECT * FROM scheduler_slots
        WHERE configuration_state = 'ready'
@@ -1818,7 +1808,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
                  capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
              WHERE slot_id = ?`,
             generation,
-            capacityDebounceDeadline(now()),
+            capacityDebounceDeadline(Date.now()),
             generation,
             slot.slot_id,
           );
@@ -1843,7 +1833,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
                capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
            WHERE slot_id = ?`,
           generation,
-          capacityDebounceDeadline(now()),
+          capacityDebounceDeadline(Date.now()),
           generation,
           slot.slot_id,
         );
@@ -1886,7 +1876,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   async status(since?: number): Promise<SchedulerStatus> {
     this.pruneEvents();
     const reserved = this.reservedResources();
-    const configured = this.configuredResources();
+    const configured = configuredCapacity(this.configuredCapacitySlots());
     const runnerByName = new Map(
       this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners").map((runner) => [runner.runner_name, runner]),
     );
@@ -1897,7 +1887,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       profileKey: job.profile_key,
       status: job.status,
       slotId: job.slot_id,
-      queueWaitMs: job.status === "queued" ? Math.max(0, now() - job.created_at) : null,
+      queueWaitMs: job.status === "queued" ? Math.max(0, Date.now() - job.created_at) : null,
       runnerId: runnerByName.get(job.runner_name)?.runner_id ?? null,
       containerStoppedAt: runnerByName.get(job.runner_name)?.container_stopped_at ?? null,
       containerExitCode: runnerByName.get(job.runner_name)?.container_exit_code ?? null,

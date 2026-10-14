@@ -193,15 +193,11 @@ abstract class GitHubActionsRunnerContainer extends Container<WorkerEnvironment>
     return this.lifetime.reconcile(provisioningDeadline);
   }
 
-  private runnerName(): string | undefined {
-    return this.ctx.id.name;
-  }
-
   override async onStop({ exitCode, reason }: { exitCode: number; reason: string }): Promise<void> {
     if (this.lifetime.reconcile(0) !== "stopped") {
       return;
     }
-    const runnerName = this.runnerName();
+    const runnerName = this.ctx.id.name;
     if (runnerName === undefined) {
       return;
     }
@@ -223,7 +219,7 @@ abstract class GitHubActionsRunnerContainer extends Container<WorkerEnvironment>
 
   override onError(cause: unknown): never {
     console.error("Cloudflare GitHub Actions runner failed to start", {
-      runnerName: this.runnerName(),
+      runnerName: this.ctx.id.name,
       error: cause instanceof Error ? cause.message : String(cause),
     });
     throw cause;

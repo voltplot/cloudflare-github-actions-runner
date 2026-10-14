@@ -38,10 +38,6 @@ const provisionStepConfig = {
   timeout: "5 minutes",
 } as const;
 
-function schedulerFor(env: WorkerEnvironment) {
-  return env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID);
-}
-
 interface EligibilityReleaseScheduler {
   provisioningFailed(jobId: string, runnerName: string, reason: string): Promise<{ admissions: SchedulerAdmission[] }>;
 }
@@ -164,7 +160,7 @@ export class RunnerProvisioningWorkflow extends WorkflowEntrypoint<
     event: Readonly<WorkflowEvent<RunnerProvisioningWorkflowParameters>>,
     step: WorkflowStep,
   ): Promise<RunnerProvisioningWorkflowResult> {
-    const scheduler = schedulerFor(this.env);
+    const scheduler = this.env.RUNNER_SCHEDULER.getByName(this.env.CLOUDFLARE_ACCOUNT_ID);
     let plan: RunnerProvisioningPlan | undefined;
     for (let attempt = 1; attempt <= 120; attempt += 1) {
       // eslint-disable-next-line no-await-in-loop -- a custom slot may be configuring for an earlier job.

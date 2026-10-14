@@ -1390,7 +1390,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     });
   }
 
-  private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
+  private finishJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs SET status = ?, updated_at = ?, failure_reason = ?, recovery_due_at = NULL WHERE job_id = ?`,
       status,
@@ -1415,7 +1415,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         current.runner_name === runnerName &&
         (current.status === "admitted" || current.status === "provisioning")
       ) {
-        this.releaseJob(current, "failed", reason);
+        this.finishJob(current, "failed", reason);
       }
     } else if (runner !== undefined) {
       this.ctx.storage.sql.exec(
@@ -1455,7 +1455,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       await this.cancelPendingRunner(job.runner_name);
     }
     if (job.status !== "completed") {
-      this.releaseJob(job, "completed");
+      this.finishJob(job, "completed");
     }
     this.recordEvent("github-job-completed", { jobId, slotId: runner?.slot_id });
     const admissions = this.admitNext();
@@ -1686,25 +1686,25 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   private reconcileSlotReservations(): void {
     const slots = this.rows<SlotRow>("SELECT * FROM scheduler_slots");
     for (const slot of slots) {
-      const activeCount =
+      const reservedCount =
         this.rows<{ count: number }>(
           `SELECT COUNT(*) AS count
          FROM scheduler_jit_runners
          WHERE slot_id = ? AND reserved = 1`,
           slot.slot_id,
         )[0]?.count ?? 0;
-      if (activeCount === slot.reserved_count) {
+      if (reservedCount === slot.reserved_count) {
         continue;
       }
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_slots SET reserved_count = ?, desired_max_instances = MAX(desired_max_instances, ?) WHERE slot_id = ?",
-        activeCount,
-        activeCount,
+        reservedCount,
+        reservedCount,
         slot.slot_id,
       );
       this.recordEvent("reservation-count-reconciled", {
         slotId: slot.slot_id,
-        detail: { from: slot.reserved_count, to: activeCount },
+        detail: { from: slot.reserved_count, to: reservedCount },
       });
     }
   }

@@ -307,130 +307,160 @@ describe("AccountRunnerScheduler stopped runners", () => {
     expect(reservedCount(status)).toBe(1);
   });
 
-  it("migrates legacy orphan and releasing runners without losing reservations on restart", async () => {
-    const scheduler = env.RUNNER_SCHEDULER.getByName("legacy-reservations");
-    const first = legacyJob("1300");
-    const second = legacyJob("1301");
-    const idle = legacyJob("1302");
-    await scheduler.submit(first);
-    await scheduler.submit(second);
-    await provisionRunner(scheduler, first, 13_001);
-    await provisionRunner(scheduler, second, 13_002);
-    await scheduler.submit(idle);
-    await provisionRunner(scheduler, idle, 13_003);
+  it.each(["legacy", "already-migrated"])("repairs %s reservations from active jobs once", async (schema) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("reservation-repair-" + schema);
+    const active = job("1300", "cf-standard-3-job-1300", "refs/heads/main");
+    const terminal = legacyJob("1301");
+    const stopped = job("1303", "cf-standard-3-job-1303", "refs/heads/main");
+    await scheduler.submit(active);
+    await scheduler.submit(terminal);
+    await scheduler.submit(stopped);
+    await setRuntime(active.runnerName, "running");
     await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec("DROP TABLE IF EXISTS scheduler_migrations");
       state.storage.sql.exec(
-        `CREATE TABLE legacy_jit (
-          runner_name TEXT PRIMARY KEY, source_job_id TEXT NOT NULL, github_owner TEXT NOT NULL,
-          github_repository TEXT NOT NULL, profile_key TEXT NOT NULL, assigned_job_id TEXT,
-          assignment_observed INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+        "UPDATE scheduler_jobs SET status = 'running', runner_id = 13001 WHERE job_id = ?",
+        active.jobId,
+      );
+      state.storage.sql.exec("UPDATE scheduler_jobs SET status = 'completed' WHERE job_id = ?", terminal.jobId);
+      // A stopped runner stays released even though its job is still active.
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'stopped-awaiting-completion', container_stopped_at = 20 WHERE job_id = ?",
+        stopped.jobId,
+      );
+      state.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET container_stopped_at = 20 WHERE runner_name = ?",
+        stopped.runnerName,
+      );
+      if (schema === "legacy") {
+        state.storage.sql.exec(
+          `CREATE TABLE legacy_jit (
+            runner_name TEXT PRIMARY KEY, source_job_id TEXT NOT NULL, github_owner TEXT NOT NULL,
+            github_repository TEXT NOT NULL, profile_key TEXT NOT NULL, assigned_job_id TEXT,
+            assignment_observed INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+          );
+          INSERT INTO legacy_jit SELECT runner_name, source_job_id, github_owner, github_repository, profile_key,
+            assigned_job_id, assignment_observed, created_at, updated_at FROM scheduler_jit_runners;
+          DROP TABLE scheduler_jit_runners;
+          ALTER TABLE legacy_jit RENAME TO scheduler_jit_runners;`,
         );
-        INSERT INTO legacy_jit SELECT runner_name, source_job_id, github_owner, github_repository, profile_key,
-          assigned_job_id, assignment_observed, created_at, updated_at FROM scheduler_jit_runners;
-        DROP TABLE scheduler_jit_runners;
-        ALTER TABLE legacy_jit RENAME TO scheduler_jit_runners;`,
-      );
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET runner_name = ?, runner_id = ?, status = 'releasing' WHERE job_id = ?",
-        second.runnerName,
-        13_002,
-        first.jobId,
-      );
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET runner_name = ?, runner_id = NULL, slot_id = NULL, status = 'queued' WHERE job_id = ?",
-        second.runnerName + "-r2",
-        second.jobId,
-      );
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET runner_name = ?, runner_id = NULL, slot_id = NULL, status = 'queued' WHERE job_id = ?",
-        idle.runnerName + "-r2",
-        idle.jobId,
-      );
-      state.storage.sql.exec(
-        "INSERT INTO scheduler_events (job_id, kind, detail_json, created_at) VALUES (?, 'github-job-requeued-after-idle-runner', ?, ?)",
-        idle.jobId,
-        JSON.stringify({ runnerName: idle.runnerName + "-r2", retryAttempt: 2 }),
-        Date.now(),
-      );
-      const incomplete = [
-        { runnerName: "legacy-missing-source", sourceJobId: "unknown-job" },
-        { runnerName: "legacy-missing-identity", sourceJobId: idle.jobId },
-        { runnerName: "legacy-missing-slot", sourceJobId: first.jobId },
-      ];
-      const legacyCreatedAt = Date.now() + 1;
-      for (const runner of incomplete) {
+      } else {
+        // Restore .9's default, inherited by .8 inserts after rollback.
+        state.storage.sql.exec(`
+          ALTER TABLE scheduler_jit_runners DROP COLUMN reserved;
+          ALTER TABLE scheduler_jit_runners ADD COLUMN reserved INTEGER NOT NULL DEFAULT 1;
+        `);
+        state.storage.sql.exec(
+          "UPDATE scheduler_jit_runners SET slot_id = '', runner_id = NULL, github_installation_id = NULL, provisioning_deadline = 0 WHERE runner_name = ?",
+          active.runnerName,
+        );
+        state.storage.sql.exec(
+          `UPDATE scheduler_jit_runners SET reserved = 0, runner_id = 13002,
+           container_stopped_at = 10, container_stop_reason = 'exit', runner_cleanup_state = 'done'
+           WHERE runner_name = ?`,
+          terminal.runnerName,
+        );
+      }
+      for (let index = 0; index < 1000; index++) {
         state.storage.sql.exec(
           `INSERT INTO scheduler_jit_runners
            (runner_name, source_job_id, github_owner, github_repository, profile_key, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          runner.runnerName,
-          runner.sourceJobId,
+           VALUES (?, ?, ?, ?, ?, 1, 1)`,
+          "historical-" + index,
+          terminal.jobId,
           legacyTarget.owner,
           legacyTarget.repository,
-          runner.runnerName === "legacy-missing-slot" ? "custom-unknown" : profile.key,
-          legacyCreatedAt,
-          legacyCreatedAt,
+          profile.key,
+        );
+      }
+      if (schema === "already-migrated") {
+        state.storage.sql.exec(
+          "UPDATE scheduler_jit_runners SET slot_id = 'preset:standard-3' WHERE runner_name LIKE 'historical-%' AND CAST(substr(runner_name, 12) AS INTEGER) < 500",
         );
       }
       state.storage.sql.exec(
-        "INSERT INTO scheduler_events (job_id, kind, detail_json, created_at) VALUES (?, 'jit-runner-created', ?, ?)",
-        first.jobId,
-        JSON.stringify({ runnerId: 13_004 }),
-        legacyCreatedAt,
+        `INSERT INTO scheduler_jit_runners
+         (runner_name, source_job_id, github_owner, github_repository, profile_key, created_at, updated_at)
+         VALUES ('missing-source', 'unknown', 'biw', 'runner-poc', 'standard-3', 1, 1),
+                ('missing-slot', '1301', 'biw', 'runner-poc', 'custom-unknown', 1, 1)`,
       );
       state.storage.sql.exec(
-        // Restart re-arms alarms; defer capacity work until migration assertions finish.
-        "UPDATE scheduler_slots SET reserved_count = 1, desired_max_instances = applied_max_instances, capacity_debounce_until = ?",
+        "UPDATE scheduler_slots SET reserved_count = 1003, desired_max_instances = 1004, applied_max_instances = 2, capacity_debounce_until = ? WHERE slot_id = 'preset:standard-3'",
         Date.now() + 60_000,
+      );
+      state.storage.sql.exec(
+        `UPDATE scheduler_slots SET desired_max_instances = 1004 WHERE slot_id = 'preset:standard-1';
+         UPDATE scheduler_slots SET applied_max_instances = 2 WHERE slot_id = 'preset:standard-2';`,
       );
       await state.storage.deleteAlarm();
     });
-    const restart = async () => {
-      await evictDurableObject(scheduler);
-      const status = await scheduler.status();
-      expect(reservedCount(status)).toBe(4);
-      await runInDurableObject(scheduler, async (_instance, state) => {
-        expect(
-          state.storage.sql
-            .exec("SELECT runner_name, runner_id, reserved FROM scheduler_jit_runners ORDER BY runner_name")
-            .toArray(),
-        ).toEqual([
-          { runner_name: first.runnerName, runner_id: 13_001, reserved: 1 },
-          { runner_name: second.runnerName, runner_id: 13_002, reserved: 1 },
-          { runner_name: idle.runnerName, runner_id: 13_003, reserved: 1 },
-          { runner_name: "legacy-missing-identity", runner_id: null, reserved: 1 },
-          { runner_name: "legacy-missing-slot", runner_id: null, reserved: 0 },
-          { runner_name: "legacy-missing-source", runner_id: null, reserved: 0 },
-        ]);
-        expect(status.events.filter((event) => event.kind === "legacy-runner-reservation-released")).toHaveLength(2);
-        await state.storage.deleteAlarm();
-      });
-    };
-    await restart();
-    await restart();
-    await setRuntime(idle.runnerName, "stopped");
-    await setRuntime("legacy-missing-identity", "stopped");
-    await runInDurableObject(scheduler, async (instance, state) => {
-      state.storage.sql.exec("UPDATE scheduler_jit_runners SET provisioning_deadline = 0");
-      const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-      try {
-        await instance.alarm();
-        expect(
-          state.storage.sql
-            .exec(
-              "SELECT reserved, container_stop_reason FROM scheduler_jit_runners WHERE runner_name IN (?, ?) ORDER BY runner_name",
-              idle.runnerName,
-              "legacy-missing-identity",
-            )
-            .toArray(),
-        ).toEqual([
-          { reserved: 0, container_stop_reason: "runtime-not-running" },
-          { reserved: 0, container_stop_reason: "runtime-not-running" },
-        ]);
-      } finally {
-        fetch.mockRestore();
-      }
+    await evictDurableObject(scheduler);
+    const status = await scheduler.status();
+    expect(status.capacity.reserved.vcpu).toBe(profile.vcpu);
+    expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")).toMatchObject({
+      reservedCount: 1,
+      desiredMaxInstances: 2,
     });
+    expect(status.slots.find((slot) => slot.slotId === "preset:standard-1")).toMatchObject({
+      reservedCount: 0,
+      desiredMaxInstances: 1,
+    });
+    expect(status.slots.find((slot) => slot.slotId === "preset:standard-2")).toMatchObject({
+      reservedCount: 0,
+      desiredMaxInstances: 1,
+    });
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      const reservation = state.storage.sql
+        .exec(
+          "SELECT runner_name, runner_id, slot_id, github_installation_id, provisioning_deadline FROM scheduler_jit_runners WHERE reserved = 1",
+        )
+        .one();
+      expect(reservation).toMatchObject({
+        runner_name: active.runnerName,
+        runner_id: 13001,
+        slot_id: "preset:standard-3",
+        github_installation_id: 42,
+      });
+      expect(reservation.provisioning_deadline).toBeGreaterThan(Date.now());
+      expect(
+        state.storage.sql.exec("SELECT COUNT(*) AS count FROM scheduler_jit_runners WHERE reserved = 0").one(),
+      ).toEqual({ count: 1004 });
+      expect(
+        state.storage.sql
+          .exec("SELECT COUNT(*) AS count FROM scheduler_events WHERE kind = 'legacy-runner-reservation-released'")
+          .one(),
+      ).toEqual({ count: 0 });
+      expect(
+        state.storage.sql
+          .exec("SELECT detail_json FROM scheduler_events WHERE kind = 'legacy-runner-reservations-initialized'")
+          .toArray(),
+      ).toEqual([{ detail_json: JSON.stringify({ unreservedCount: 1004 }) }]);
+      expect(
+        state.storage.sql
+          .exec(
+            "SELECT runner_id, container_stopped_at, runner_cleanup_state FROM scheduler_jit_runners WHERE runner_name = ?",
+            terminal.runnerName,
+          )
+          .one(),
+      ).toEqual(
+        schema === "already-migrated"
+          ? { runner_id: 13002, container_stopped_at: 10, runner_cleanup_state: "done" }
+          : { runner_id: null, container_stopped_at: null, runner_cleanup_state: "none" },
+      );
+      await state.storage.deleteAlarm();
+    });
+    const next = legacyJob("1302");
+    expect((await scheduler.submit(next)).admissions).toContainEqual(expect.objectContaining({ jobId: next.jobId }));
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // Future crossed runners survive restart after their source jobs complete.
+      state.storage.sql.exec("UPDATE scheduler_jobs SET status = 'completed' WHERE job_id = ?", active.jobId);
+      await state.storage.deleteAlarm();
+    });
+    await evictDurableObject(scheduler);
+    const restarted = await scheduler.status();
+    expect(reservedCount(restarted)).toBe(2);
+    expect(restarted.events.filter((event) => event.kind === "legacy-runner-reservations-initialized")).toHaveLength(1);
+    expect(restarted.events.some((event) => event.kind === "reservation-count-reconciled")).toBe(true);
   });
 
   it.each(["admitted", "provisioning"])(

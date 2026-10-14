@@ -1,11 +1,14 @@
 import { env, evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import type { SchedulerJobInput } from "../../src/account-runner-scheduler";
+import type { AccountRunnerScheduler, SchedulerJobInput, SchedulerStatus } from "../../src/account-runner-scheduler";
 import { RUNNER_PROFILES } from "../../src/runner-profiles";
 
 const target = { owner: "biw", repository: "runner-poc" };
 const profile = RUNNER_PROFILES["standard-3"];
+
+const queuedGitHubResponse: typeof fetch = async (_input, init) =>
+  init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" });
 
 function job(jobId: string, runnerName: string, cacheScope: string): SchedulerJobInput {
   return {
@@ -27,19 +30,19 @@ async function setRuntime(runnerName: string, state: "running" | "starting" | "s
   expect(response.status).toBe(204);
 }
 
-async function provisionRunner(
-  scheduler: DurableObjectStub<import("../../src/account-runner-scheduler").AccountRunnerScheduler>,
-  jobId: string,
-  runnerName: string,
-  runnerId: number,
-): Promise<void> {
-  await runInDurableObject(scheduler, async (_instance, state) => {
+function reservedCount(status: SchedulerStatus): number | undefined {
+  return status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount;
+}
+
+async function prepareProvisioning(scheduler: DurableObjectStub<AccountRunnerScheduler>, jobId: string): Promise<void> {
+  await runInDurableObject(scheduler, (_instance, state) => {
     // Apply capacity locally so the alarm cannot call the Containers API.
     state.storage.sql.exec(
       `UPDATE scheduler_slots
        SET applied_max_instances = desired_max_instances,
            capacity_debounce_until = 0,
-           capacity_update_in_progress = 0
+           capacity_update_in_progress = 0,
+           capacity_reclaim_pending = 0
        WHERE slot_id = 'preset:standard-3'`,
     );
     state.storage.sql.exec(
@@ -47,12 +50,20 @@ async function provisionRunner(
       jobId,
     );
   });
-  await scheduler.runnerProvisioned(jobId, runnerName, runnerId);
-  await setRuntime(runnerName, "running");
+}
+
+async function provisionRunner(
+  scheduler: DurableObjectStub<AccountRunnerScheduler>,
+  queuedJob: SchedulerJobInput,
+  runnerId: number,
+): Promise<void> {
+  await prepareProvisioning(scheduler, queuedJob.jobId);
+  await scheduler.runnerProvisioned(queuedJob.jobId, queuedJob.runnerName, runnerId);
+  await setRuntime(queuedJob.runnerName, "running");
   await runInDurableObject(scheduler, (_instance, state) => {
     state.storage.sql.exec(
       "UPDATE scheduler_jit_runners SET provisioning_deadline = 0 WHERE runner_name = ?",
-      runnerName,
+      queuedJob.runnerName,
     );
   });
 }
@@ -63,19 +74,7 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     const queuedJob = job("50", "cf-standard-3-job-50", "refs/heads/main");
 
     await scheduler.submit(queuedJob);
-    await runInDurableObject(scheduler, async (_instance, state) => {
-      state.storage.sql.exec(
-        `UPDATE scheduler_jobs SET status = 'provisioning', slot_id = 'preset:standard-3' WHERE job_id = ?`,
-        queuedJob.jobId,
-      );
-      state.storage.sql.exec(
-        `UPDATE scheduler_slots
-         SET applied_max_instances = desired_max_instances,
-             capacity_update_in_progress = 0,
-             capacity_reclaim_pending = 0
-         WHERE slot_id = 'preset:standard-3'`,
-      );
-    });
+    await prepareProvisioning(scheduler, queuedJob.jobId);
 
     await expect(scheduler.claimProvisioning(queuedJob.jobId)).resolves.toMatchObject({
       kind: "provision",
@@ -91,8 +90,8 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
 
     await scheduler.submit(firstJob);
     await scheduler.submit(secondJob);
-    await provisionRunner(scheduler, firstJob.jobId, firstJob.runnerName, 1_001);
-    await provisionRunner(scheduler, secondJob.jobId, secondJob.runnerName, 2_001);
+    await provisionRunner(scheduler, firstJob, 1_001);
+    await provisionRunner(scheduler, secondJob, 2_001);
 
     await scheduler.workflowJobStarted({
       jobId: secondJob.jobId,
@@ -124,7 +123,7 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     const queuedJob = job("300", "cf-standard-3-job-300", "refs/pull/300/merge");
 
     await scheduler.submit(queuedJob);
-    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 3_001);
+    await provisionRunner(scheduler, queuedJob, 3_001);
 
     await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
   });
@@ -134,7 +133,7 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     const queuedJob = job("400", "cf-standard-3-job-400", "refs/pull/400/merge");
 
     await scheduler.submit(queuedJob);
-    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 4_001);
+    await provisionRunner(scheduler, queuedJob, 4_001);
     await scheduler.workflowJobStarted({
       jobId: queuedJob.jobId,
       runnerName: queuedJob.runnerName,
@@ -161,13 +160,9 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const heldJob = legacyJob("900");
 
     await scheduler.submit(heldJob);
-    await provisionRunner(scheduler, heldJob.jobId, heldJob.runnerName, 9_001);
+    await provisionRunner(scheduler, heldJob, 9_001);
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi
-        .spyOn(globalThis, "fetch")
-        .mockImplementation(async (_input, init) =>
-          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
-        );
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         await instance.runnerStopped(heldJob.runnerName, { exitCode: 0, reason: "exit" });
         state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", heldJob.jobId);
@@ -193,8 +188,8 @@ describe("AccountRunnerScheduler stopped runners", () => {
 
     await scheduler.submit(sourceJob);
     await scheduler.submit(otherJob);
-    await provisionRunner(scheduler, sourceJob.jobId, sourceJob.runnerName, 10_001);
-    await provisionRunner(scheduler, otherJob.jobId, otherJob.runnerName, 10_002);
+    await provisionRunner(scheduler, sourceJob, 10_001);
+    await provisionRunner(scheduler, otherJob, 10_002);
 
     const deletes: string[] = [];
     await runInDurableObject(scheduler, async (instance, state) => {
@@ -245,8 +240,8 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const third = legacyJob("1102");
     await scheduler.submit(first);
     await scheduler.submit(second);
-    await provisionRunner(scheduler, first.jobId, first.runnerName, 11_001);
-    await provisionRunner(scheduler, second.jobId, second.runnerName, 11_002);
+    await provisionRunner(scheduler, first, 11_001);
+    await provisionRunner(scheduler, second, 11_002);
     await scheduler.workflowJobStarted({
       jobId: first.jobId,
       runnerName: second.runnerName,
@@ -265,10 +260,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     });
     await scheduler.workflowJobCompleted(second.jobId);
     await scheduler.workflowJobCompleted(third.jobId);
-    const reserved = async () => {
-      const status = await scheduler.status();
-      return status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount;
-    };
+    const reserved = async () => reservedCount(await scheduler.status());
     expect(await reserved()).toBe(2);
     await runInDurableObject(scheduler, async (instance, state) => {
       state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0");
@@ -289,13 +281,9 @@ describe("AccountRunnerScheduler stopped runners", () => {
       const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
       try {
         await instance.runnerStopped(second.runnerName, { exitCode: 0, reason: "exit" });
-        expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-          1,
-        );
+        expect(reservedCount(await instance.status())).toBe(1);
         await instance.runnerStopped(second.runnerName, { exitCode: 0, reason: "exit" });
-        expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-          1,
-        );
+        expect(reservedCount(await instance.status())).toBe(1);
         await instance.runnerStopped(first.runnerName, { exitCode: 0, reason: "exit" });
       } finally {
         fetch.mockRestore();
@@ -316,7 +304,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await scheduler.provisioningFailed(source.jobId, source.runnerName, "late workflow failure");
     await setRuntime(source.runnerName, "running");
     const status = await scheduler.status();
-    expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
+    expect(reservedCount(status)).toBe(1);
   });
 
   it("migrates legacy orphan and releasing runners without losing reservations on restart", async () => {
@@ -326,10 +314,10 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const idle = legacyJob("1302");
     await scheduler.submit(first);
     await scheduler.submit(second);
-    await provisionRunner(scheduler, first.jobId, first.runnerName, 13_001);
-    await provisionRunner(scheduler, second.jobId, second.runnerName, 13_002);
+    await provisionRunner(scheduler, first, 13_001);
+    await provisionRunner(scheduler, second, 13_002);
     await scheduler.submit(idle);
-    await provisionRunner(scheduler, idle.jobId, idle.runnerName, 13_003);
+    await provisionRunner(scheduler, idle, 13_003);
     await runInDurableObject(scheduler, async (_instance, state) => {
       state.storage.sql.exec(
         `CREATE TABLE legacy_jit (
@@ -400,7 +388,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const restart = async () => {
       await evictDurableObject(scheduler);
       const status = await scheduler.status();
-      expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(4);
+      expect(reservedCount(status)).toBe(4);
       await runInDurableObject(scheduler, async (_instance, state) => {
         expect(
           state.storage.sql
@@ -452,7 +440,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
       const source = legacyJob("1400");
       const actual = legacyJob("1401");
       await scheduler.submit(source);
-      await provisionRunner(scheduler, source.jobId, source.runnerName, 14_001);
+      await provisionRunner(scheduler, source, 14_001);
       await scheduler.submit(actual);
       await runInDurableObject(scheduler, (_instance, state) => {
         state.storage.sql.exec("UPDATE scheduler_jobs SET status = ? WHERE job_id = ?", pendingStatus, actual.jobId);
@@ -464,13 +452,11 @@ describe("AccountRunnerScheduler stopped runners", () => {
         profile,
       });
       await expect(scheduler.claimProvisioning(actual.jobId)).resolves.toEqual({ kind: "cancelled" });
-      expect((await scheduler.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-        1,
-      );
+      expect(reservedCount(await scheduler.status())).toBe(1);
       await scheduler.provisioningFailed(actual.jobId, actual.runnerName, "cancelled own workflow");
       const status = await scheduler.status();
       expect(status.jobs.find((row) => row.jobId === actual.jobId)?.status).toBe("running");
-      expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
+      expect(reservedCount(status)).toBe(1);
     },
   );
 
@@ -484,20 +470,16 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await expect(scheduler.claimProvisioning(source.jobId)).resolves.toEqual({ kind: "cancelled" });
     const status = await scheduler.status();
     expect(status.jobs.find((row) => row.jobId === source.jobId)?.status).toBe("completed");
-    expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(0);
+    expect(reservedCount(status)).toBe(0);
   });
 
   it("rejects a delayed start after stop so queued demand still gets a fresh runner", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("late-assignment");
     const source = legacyJob("1600");
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 16_001);
+    await provisionRunner(scheduler, source, 16_001);
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi
-        .spyOn(globalThis, "fetch")
-        .mockImplementation(async (_input, init) =>
-          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
-        );
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         await instance.runnerStopped(source.runnerName, { exitCode: 1, reason: "exit" });
         await expect(
@@ -524,7 +506,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const source = legacyJob("1700");
     const actual = legacyJob("1701");
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 17_001);
+    await provisionRunner(scheduler, source, 17_001);
     await scheduler.submit(actual);
     await scheduler.workflowJobStarted({
       jobId: actual.jobId,
@@ -534,11 +516,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     });
     await scheduler.workflowJobCompleted(source.jobId);
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi
-        .spyOn(globalThis, "fetch")
-        .mockImplementation(async (_input, init) =>
-          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
-        );
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         await instance.runnerStopped(source.runnerName, { exitCode: 1, reason: "exit" });
         state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", actual.jobId);
@@ -564,17 +542,13 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("runtime-stop-" + jobId);
     const source = legacyJob(jobId);
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, Number(jobId));
+    await provisionRunner(scheduler, source, Number(jobId));
     if (failure === "start failure") {
       await scheduler.provisioningFailed(source.jobId, source.runnerName, "Container start threw");
     }
     await setRuntime(source.runnerName, "stopped");
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi
-        .spyOn(globalThis, "fetch")
-        .mockImplementation(async (_input, init) =>
-          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
-        );
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         await instance.alarm();
         expect(
@@ -609,7 +583,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const source = legacyJob("2100");
     const actual = legacyJob("2101");
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 21_000);
+    await provisionRunner(scheduler, source, 21_000);
     await scheduler.submit(actual);
     await scheduler.workflowJobStarted({
       jobId: actual.jobId,
@@ -620,11 +594,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await scheduler.workflowJobCompleted(actual.jobId, source.runnerName);
     await setRuntime(source.runnerName, "stopped");
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi
-        .spyOn(globalThis, "fetch")
-        .mockImplementation(async (_input, init) =>
-          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
-        );
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         await instance.alarm();
         state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", source.jobId);
@@ -669,7 +639,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const source = legacyJob("2160");
     const actual = legacyJob("2161");
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 21_600);
+    await provisionRunner(scheduler, source, 21_600);
     await scheduler.submit(actual);
     await runInDurableObject(scheduler, async (instance) => {
       const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
@@ -733,7 +703,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("runtime-live-and-unavailable");
     const source = legacyJob("2200");
     await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 22_000);
+    await provisionRunner(scheduler, source, 22_000);
     await scheduler.workflowJobStarted({
       jobId: source.jobId,
       runnerName: source.runnerName,
@@ -744,15 +714,13 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await runInDurableObject(scheduler, async (instance, state) => {
       state.storage.sql.exec("UPDATE scheduler_jobs SET updated_at = 0 WHERE job_id = ?", source.jobId);
       await instance.alarm();
-      expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-        1,
-      );
+      expect(reservedCount(await instance.status())).toBe(1);
     });
     await setRuntime(source.runnerName, "error");
     await runInDurableObject(scheduler, (instance) => instance.alarm());
     await runInDurableObject(scheduler, (instance) => instance.alarm());
     const status = await scheduler.status();
-    expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
+    expect(reservedCount(status)).toBe(1);
     expect(status.events.filter((event) => event.kind === "runner-runtime-reconciliation-retry")).toHaveLength(1);
   });
 });

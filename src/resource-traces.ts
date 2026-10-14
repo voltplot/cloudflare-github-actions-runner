@@ -7,9 +7,9 @@ const maxSamplesPerRequest = 15;
 // Longer than GitHub's 5-day self-hosted job limit, so no live runner loses its assignment.
 // https://docs.github.com/en/actions/reference/limits#existing-system-limits
 const resourceTraceRetentionMs = 7 * 24 * 60 * 60 * 1_000;
-// D1 bounds the work of one query: https://developers.cloudflare.com/d1/platform/limits/
-const retentionDeleteBatchRows = 10_000;
-const retentionDeleteMaxBatches = 50;
+// Far above the samples one upload adds, and small enough for D1's per-query limits:
+// https://developers.cloudflare.com/d1/platform/limits/
+const retentionDeleteBatchRows = 1_000;
 
 export interface ResourceTraceEnvironment {
   RESOURCE_METRICS: D1Database;
@@ -248,27 +248,20 @@ export async function persistResourceTraceSamples(
   );
 }
 
-/** Deletes trace rows older than the retention window, at most a bounded number per call. */
+/** Deletes one bounded batch of trace rows older than the retention window from each table. */
 export async function deleteExpiredResourceTraces(
   env: Pick<ResourceTraceEnvironment, "RESOURCE_METRICS">,
   now = Date.now(),
 ): Promise<void> {
   const cutoff = now - resourceTraceRetentionMs;
-  const deletes = [
-    `DELETE FROM resource_trace_samples WHERE (runner_name, sample_elapsed_seconds) IN
-     (SELECT runner_name, sample_elapsed_seconds FROM resource_trace_samples WHERE received_at < ?1 LIMIT ?2)`,
-    `DELETE FROM resource_trace_assignments WHERE runner_name IN
-     (SELECT runner_name FROM resource_trace_assignments WHERE assigned_at < ?1 LIMIT ?2)`,
-  ].map((sql) => env.RESOURCE_METRICS.prepare(sql).bind(cutoff, retentionDeleteBatchRows));
-  for (const statement of deletes) {
-    for (let batch = 0; batch < retentionDeleteMaxBatches; batch += 1) {
-      // eslint-disable-next-line no-await-in-loop -- each batch runs only after the previous one finished.
-      const { meta } = await statement.run();
-      if (meta.changes < retentionDeleteBatchRows) {
-        break;
-      }
-    }
-  }
+  await env.RESOURCE_METRICS.batch(
+    [
+      `DELETE FROM resource_trace_samples WHERE (runner_name, sample_elapsed_seconds) IN
+       (SELECT runner_name, sample_elapsed_seconds FROM resource_trace_samples WHERE received_at < ?1 LIMIT ?2)`,
+      `DELETE FROM resource_trace_assignments WHERE runner_name IN
+       (SELECT runner_name FROM resource_trace_assignments WHERE assigned_at < ?1 LIMIT ?2)`,
+    ].map((sql) => env.RESOURCE_METRICS.prepare(sql).bind(cutoff, retentionDeleteBatchRows)),
+  );
 }
 
 /**

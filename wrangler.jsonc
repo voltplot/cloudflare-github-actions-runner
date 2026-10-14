@@ -11,9 +11,10 @@
     // Debug live with `wrangler tail`. https://developers.cloudflare.com/workers/observability/logs/workers-logs/#limits
     "enabled": false,
   },
-  // Hourly resource-trace retention (src/resource-traces.ts). https://developers.cloudflare.com/workers/configuration/cron-triggers/
+  // An empty list removes a deployed cron; omitting it would not.
+  // https://developers.cloudflare.com/workers/wrangler/configuration/#triggers
   "triggers": {
-    "crons": ["17 * * * *"],
+    "crons": [],
   },
   "d1_databases": [
     {

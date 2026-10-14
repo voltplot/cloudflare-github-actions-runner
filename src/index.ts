@@ -332,6 +332,19 @@ export default {
       if (trace === undefined) {
         return json({ error: "Invalid resource trace payload" }, 400);
       }
+      // Every upload pays for retention, so deletion keeps pace with writes even when D1 is full.
+      // Cron Triggers never fired for this Worker.
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await deleteExpiredResourceTraces(env);
+          } catch (error) {
+            console.warn("Could not delete expired resource traces", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })(),
+      );
       try {
         await persistResourceTraceSamples(env, claim, trace.samples);
       } catch (error) {
@@ -647,9 +660,5 @@ export default {
       });
       return json({ error: "Runner scheduling failed" }, 500);
     }
-  },
-
-  async scheduled(_controller: ScheduledController, env: WorkerEnvironment): Promise<void> {
-    await deleteExpiredResourceTraces(env);
   },
 } satisfies ExportedHandler<WorkerEnvironment>;

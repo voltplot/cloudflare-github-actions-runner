@@ -1470,6 +1470,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     try {
       return await runnerContainerFor(this.env, runner.slot_id, runner.runner_name).reconcile(deadline);
     } catch (error) {
+      const [lastEvent] = this.rows<{ kind: string }>(
+        "SELECT kind FROM scheduler_events WHERE job_id = ? ORDER BY created_at DESC, event_id DESC LIMIT 1",
+        runner.source_job_id,
+      );
+      // One event per outage: a retry every alarm would push the capped history out.
+      if (lastEvent?.kind === "runner-runtime-reconciliation-retry") {
+        return "unavailable";
+      }
       this.recordEvent("runner-runtime-reconciliation-retry", {
         jobId: runner.source_job_id,
         slotId: runner.slot_id,

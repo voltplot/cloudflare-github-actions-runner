@@ -755,8 +755,9 @@ describe("AccountRunnerScheduler stopped runners", () => {
     });
     await setRuntime(source.runnerName, "error");
     await runInDurableObject(scheduler, (instance) => instance.alarm());
+    await runInDurableObject(scheduler, (instance) => instance.alarm());
     const status = await scheduler.status();
     expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
-    expect(status.events.some((event) => event.kind === "runner-runtime-reconciliation-retry")).toBe(true);
+    expect(status.events.filter((event) => event.kind === "runner-runtime-reconciliation-retry")).toHaveLength(1);
   });
 });

@@ -330,12 +330,7 @@ function matchesRunner(
   );
 }
 
-/**
- * One scheduler exists per Cloudflare account. The account is deliberately the
- * coordination atom: all capacity reservations for this runner service live in
- * one SQLite-backed Durable Object. Its alarm serializes Cloudflare capacity
- * mutations, while Workflows handle only runner start and rollout polling.
- */
+/** One SQLite-backed Durable Object serializes account-wide capacity mutations. */
 export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   constructor(ctx: DurableObjectState, env: WorkerEnvironment) {
     super(ctx, env);
@@ -348,9 +343,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         this.pruneEvents();
       });
       this.recoverStalledCapacityUpdates();
-      // A Worker deployment can reset an in-flight scheduler invocation. Re-arm
-      // the persisted alarm while reconstructing the DO so queued capacity
-      // changes and recovery work continue without another GitHub delivery.
+      // Deployments can interrupt work; reconstruction must re-arm the persisted alarm.
       await this.scheduleWorkAlarmIfNeeded();
     });
   }
@@ -533,8 +526,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     for (const [name, definition] of migrations) {
       this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jit_runners ADD COLUMN ${name} ${definition}`);
     }
-    // Legacy assignments erased some job ownership. Keep recoverable identities;
-    // incomplete history must not prevent the account scheduler from starting.
+    // Legacy assignments can overwrite the source job's runner identity.
     for (const runner of this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners")) {
       const source = this.job(runner.source_job_id);
       if (source === undefined) {
@@ -1508,7 +1500,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return { accepted: true, admissions };
   }
 
-  /** Only a recorded container stop permits deregistering a runner. */
   private async retryRunnerCleanup(runner: StoppedJitRunnerRow): Promise<void> {
     let retryReason: string | undefined;
     try {
@@ -1624,7 +1615,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     });
   }
 
-  /** Rebuild slot counts from runner reservations, including runners whose source job finished. */
   private reconcileSlotReservations(): void {
     const slots = this.rows<SlotRow>("SELECT * FROM scheduler_slots");
     for (const slot of slots) {

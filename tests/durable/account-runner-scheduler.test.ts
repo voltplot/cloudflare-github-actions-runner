@@ -34,11 +34,7 @@ async function provisionRunner(
   runnerId: number,
 ): Promise<void> {
   await runInDurableObject(scheduler, async (_instance, state) => {
-    // Admission capacity is separately covered by scheduler-policy tests. This
-    // test prepares two live, compatible JIT runners to reproduce GitHub's
-    // out-of-order assignment race without calling the Containers API. Mark
-    // the pending capacity operation as already applied so the Durable Object
-    // alarm cannot race this test and issue a real capacity request.
+    // Apply capacity locally so the alarm cannot call the Containers API.
     state.storage.sql.exec(
       `UPDATE scheduler_slots
        SET applied_max_instances = desired_max_instances,
@@ -229,7 +225,6 @@ describe("AccountRunnerScheduler stopped runners", () => {
             .toArray(),
         ).toEqual([{ status: "running", runner_name: sourceJob.runnerName }]);
         await instance.workflowJobCompleted(sourceJob.jobId);
-        // Legacy cleanup retries must never delete a live runner.
         state.storage.sql.exec(
           "UPDATE scheduler_jit_runners SET runner_cleanup_state = 'retry', runner_cleanup_due_at = 0 WHERE runner_name = ?",
           otherJob.runnerName,

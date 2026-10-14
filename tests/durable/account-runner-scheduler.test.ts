@@ -311,8 +311,10 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("reservation-repair-" + schema);
     const active = job("1300", "cf-standard-3-job-1300", "refs/heads/main");
     const terminal = legacyJob("1301");
+    const stopped = job("1303", "cf-standard-3-job-1303", "refs/heads/main");
     await scheduler.submit(active);
     await scheduler.submit(terminal);
+    await scheduler.submit(stopped);
     await setRuntime(active.runnerName, "running");
     await runInDurableObject(scheduler, async (_instance, state) => {
       state.storage.sql.exec("DROP TABLE IF EXISTS scheduler_migrations");
@@ -321,6 +323,15 @@ describe("AccountRunnerScheduler stopped runners", () => {
         active.jobId,
       );
       state.storage.sql.exec("UPDATE scheduler_jobs SET status = 'completed' WHERE job_id = ?", terminal.jobId);
+      // A stopped runner stays released even though its job is still active.
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'stopped-awaiting-completion', container_stopped_at = 20 WHERE job_id = ?",
+        stopped.jobId,
+      );
+      state.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET container_stopped_at = 20 WHERE runner_name = ?",
+        stopped.runnerName,
+      );
       if (schema === "legacy") {
         state.storage.sql.exec(
           `CREATE TABLE legacy_jit (
@@ -413,7 +424,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
       expect(reservation.provisioning_deadline).toBeGreaterThan(Date.now());
       expect(
         state.storage.sql.exec("SELECT COUNT(*) AS count FROM scheduler_jit_runners WHERE reserved = 0").one(),
-      ).toEqual({ count: 1003 });
+      ).toEqual({ count: 1004 });
       expect(
         state.storage.sql
           .exec("SELECT COUNT(*) AS count FROM scheduler_events WHERE kind = 'legacy-runner-reservation-released'")
@@ -423,7 +434,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
         state.storage.sql
           .exec("SELECT detail_json FROM scheduler_events WHERE kind = 'legacy-runner-reservations-initialized'")
           .toArray(),
-      ).toEqual([{ detail_json: JSON.stringify({ unreservedCount: 1003 }) }]);
+      ).toEqual([{ detail_json: JSON.stringify({ unreservedCount: 1004 }) }]);
       expect(
         state.storage.sql
           .exec(

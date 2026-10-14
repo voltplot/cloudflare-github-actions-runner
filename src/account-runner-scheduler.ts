@@ -687,7 +687,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
        (runner_name, source_job_id, github_owner, github_repository, profile_key, slot_id, reserved,
         github_installation_id, created_at, updated_at, provisioning_deadline)
        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-       ON CONFLICT(runner_name) DO UPDATE SET reserved = 1, slot_id = excluded.slot_id`,
+       ON CONFLICT(runner_name) DO UPDATE SET reserved = container_stopped_at IS NULL, slot_id = excluded.slot_id`,
       job.runner_name,
       job.job_id,
       job.github_owner,

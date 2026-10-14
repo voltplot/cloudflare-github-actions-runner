@@ -87,6 +87,22 @@ export default defineConfig({
         plugins: [
           cloudflareTest({
             miniflare: {
+              durableObjects: {
+                RUNNER_STANDARD_3: {
+                  className: "RunnerRuntimeFixture",
+                  scriptName: "runner-runtime-fixture",
+                  useSQLite: true,
+                },
+              },
+              workers: [
+                {
+                  name: "runner-runtime-fixture",
+                  compatibilityDate: "2026-08-12",
+                  modules: true,
+                  scriptPath: "tests/fixtures/runner-runtime.mjs",
+                  durableObjects: { RUNTIME: { className: "RunnerRuntimeFixture", useSQLite: true } },
+                },
+              ],
               bindings: {
                 GITHUB_RUNNER_TOKEN: "test-runner-token",
                 RUNNER_CACHE_MAX_BYTES: "20",

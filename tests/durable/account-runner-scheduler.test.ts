@@ -20,6 +20,13 @@ function job(jobId: string, runnerName: string, cacheScope: string): SchedulerJo
   };
 }
 
+async function setRuntime(runnerName: string, state: "running" | "starting" | "stopped" | "error"): Promise<void> {
+  const response = await env.RUNNER_STANDARD_3.getByName(runnerName).fetch(`https://runtime/${state}`, {
+    method: "POST",
+  });
+  expect(response.status).toBe(204);
+}
+
 async function provisionRunner(
   scheduler: DurableObjectStub<import("../../src/account-runner-scheduler").AccountRunnerScheduler>,
   jobId: string,
@@ -45,7 +52,13 @@ async function provisionRunner(
     );
   });
   await scheduler.runnerProvisioned(jobId, runnerName, runnerId);
-  await scheduler.runnerStarted(runnerName);
+  await setRuntime(runnerName, "running");
+  await runInDurableObject(scheduler, (_instance, state) => {
+    state.storage.sql.exec(
+      "UPDATE scheduler_jit_runners SET provisioning_deadline = 0 WHERE runner_name = ?",
+      runnerName,
+    );
+  });
 }
 
 describe("AccountRunnerScheduler JIT cache assignments", () => {
@@ -281,7 +294,6 @@ describe("AccountRunnerScheduler stopped runners", () => {
       const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
       try {
         await instance.runnerStopped(second.runnerName, { exitCode: 0, reason: "exit" });
-        await instance.runnerStarted(second.runnerName);
         expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
           1,
         );
@@ -297,98 +309,6 @@ describe("AccountRunnerScheduler stopped runners", () => {
     expect(await reserved()).toBe(0);
   });
 
-  it("releases a completed assignment after the grace when onStop never arrives", async () => {
-    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-assignment-no-stop");
-    const source = legacyJob("1800");
-    const actual = { ...legacyJob("1801"), headSha: "" };
-    await scheduler.submit(source);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 18_001);
-    await scheduler.submit(actual);
-    // The completed delivery identifies the actual runner even if in_progress was lost.
-    await scheduler.workflowJobCompleted(actual.jobId, source.runnerName);
-    await runInDurableObject(scheduler, async (instance, state) => {
-      const completion = state.storage.sql
-        .exec<{ updated_at: number }>("SELECT updated_at FROM scheduler_jobs WHERE job_id = ?", actual.jobId)
-        .one();
-      expect(await state.storage.getAlarm()).toBe(completion.updated_at + 30_000);
-      await instance.alarm();
-      expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-        1,
-      );
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET updated_at = ? WHERE job_id = ?",
-        Date.now() - 30_001,
-        actual.jobId,
-      );
-      await instance.submit({ ...actual, headSha: source.headSha });
-      await instance.workflowJobCompleted(actual.jobId, source.runnerName);
-      await instance.alarm();
-      expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-        0,
-      );
-      expect(
-        state.storage.sql
-          .exec(
-            "SELECT reserved, container_stopped_at FROM scheduler_jit_runners WHERE runner_name = ?",
-            source.runnerName,
-          )
-          .toArray(),
-      ).toEqual([{ reserved: 0, container_stopped_at: null }]);
-      expect(
-        (await instance.status()).events.filter((event) => event.kind === "container-stop-missing-recovered"),
-      ).toHaveLength(1);
-      await state.storage.deleteAlarm();
-    });
-    await evictDurableObject(scheduler);
-    expect((await scheduler.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(0);
-  });
-
-  it("does not release a completed source job's runner while it runs another job", async () => {
-    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-source-live-assignment");
-    const source = legacyJob("1900");
-    const actual = legacyJob("1901");
-    await scheduler.submit(source);
-    await scheduler.submit(actual);
-    await provisionRunner(scheduler, source.jobId, source.runnerName, 19_001);
-    await provisionRunner(scheduler, actual.jobId, actual.runnerName, 19_002);
-    await scheduler.workflowJobStarted({
-      jobId: source.jobId,
-      runnerName: actual.runnerName,
-      target: legacyTarget,
-      profile,
-    });
-    await scheduler.workflowJobStarted({
-      jobId: actual.jobId,
-      runnerName: source.runnerName,
-      target: legacyTarget,
-      profile,
-    });
-    await scheduler.workflowJobCompleted(source.jobId, actual.runnerName);
-    await runInDurableObject(scheduler, async (_instance, state) => {
-      state.storage.sql.exec(
-        "UPDATE scheduler_jobs SET updated_at = ? WHERE job_id = ?",
-        Date.now() - 30_001,
-        source.jobId,
-      );
-      await state.storage.deleteAlarm();
-    });
-    await evictDurableObject(scheduler);
-    await runInDurableObject(scheduler, async (instance, state) => {
-      await instance.alarm();
-      expect(
-        state.storage.sql
-          .exec("SELECT runner_name, assigned_job_id, reserved FROM scheduler_jit_runners ORDER BY runner_name")
-          .toArray(),
-      ).toEqual([
-        { runner_name: source.runnerName, assigned_job_id: actual.jobId, reserved: 1 },
-        { runner_name: actual.runnerName, assigned_job_id: source.jobId, reserved: 0 },
-      ]);
-      expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
-        1,
-      );
-    });
-  });
-
   it("retains a reservation when completion and provisioning failure race a recorded JIT start", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("late-jit-start");
     const source = legacyJob("1200");
@@ -398,8 +318,8 @@ describe("AccountRunnerScheduler stopped runners", () => {
     });
     await scheduler.workflowJobCompleted(source.jobId);
     await scheduler.runnerProvisioned(source.jobId, source.runnerName, 12_001);
-    await scheduler.provisioningFailed(source.jobId, "late workflow failure");
-    await scheduler.runnerStarted(source.runnerName);
+    await scheduler.provisioningFailed(source.jobId, source.runnerName, "late workflow failure");
+    await setRuntime(source.runnerName, "running");
     const status = await scheduler.status();
     expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
   });
@@ -464,7 +384,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
           runner.sourceJobId,
           legacyTarget.owner,
           legacyTarget.repository,
-          profile.key,
+          runner.runnerName === "legacy-missing-slot" ? "custom-unknown" : profile.key,
           legacyCreatedAt,
           legacyCreatedAt,
         );
@@ -476,14 +396,16 @@ describe("AccountRunnerScheduler stopped runners", () => {
         legacyCreatedAt,
       );
       state.storage.sql.exec(
-        "UPDATE scheduler_slots SET reserved_count = 1, desired_max_instances = applied_max_instances",
+        // Restart re-arms alarms; defer capacity work until migration assertions finish.
+        "UPDATE scheduler_slots SET reserved_count = 1, desired_max_instances = applied_max_instances, capacity_debounce_until = ?",
+        Date.now() + 60_000,
       );
       await state.storage.deleteAlarm();
     });
     const restart = async () => {
       await evictDurableObject(scheduler);
       const status = await scheduler.status();
-      expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(2);
+      expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(4);
       await runInDurableObject(scheduler, async (_instance, state) => {
         expect(
           state.storage.sql
@@ -492,17 +414,40 @@ describe("AccountRunnerScheduler stopped runners", () => {
         ).toEqual([
           { runner_name: first.runnerName, runner_id: 13_001, reserved: 1 },
           { runner_name: second.runnerName, runner_id: 13_002, reserved: 1 },
-          { runner_name: idle.runnerName, runner_id: 13_003, reserved: 0 },
-          { runner_name: "legacy-missing-identity", runner_id: null, reserved: 0 },
+          { runner_name: idle.runnerName, runner_id: 13_003, reserved: 1 },
+          { runner_name: "legacy-missing-identity", runner_id: null, reserved: 1 },
           { runner_name: "legacy-missing-slot", runner_id: null, reserved: 0 },
           { runner_name: "legacy-missing-source", runner_id: null, reserved: 0 },
         ]);
-        expect(status.events.filter((event) => event.kind === "legacy-runner-reservation-released")).toHaveLength(3);
+        expect(status.events.filter((event) => event.kind === "legacy-runner-reservation-released")).toHaveLength(2);
         await state.storage.deleteAlarm();
       });
     };
     await restart();
     await restart();
+    await setRuntime(idle.runnerName, "stopped");
+    await setRuntime("legacy-missing-identity", "stopped");
+    await runInDurableObject(scheduler, async (instance, state) => {
+      state.storage.sql.exec("UPDATE scheduler_jit_runners SET provisioning_deadline = 0");
+      const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+      try {
+        await instance.alarm();
+        expect(
+          state.storage.sql
+            .exec(
+              "SELECT reserved, container_stop_reason FROM scheduler_jit_runners WHERE runner_name IN (?, ?) ORDER BY runner_name",
+              idle.runnerName,
+              "legacy-missing-identity",
+            )
+            .toArray(),
+        ).toEqual([
+          { reserved: 0, container_stop_reason: "runtime-not-running" },
+          { reserved: 0, container_stop_reason: "runtime-not-running" },
+        ]);
+      } finally {
+        fetch.mockRestore();
+      }
+    });
   });
 
   it.each(["admitted", "provisioning"])(
@@ -527,7 +472,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
       expect((await scheduler.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
         1,
       );
-      await scheduler.provisioningFailed(actual.jobId, "cancelled own workflow");
+      await scheduler.provisioningFailed(actual.jobId, actual.runnerName, "cancelled own workflow");
       const status = await scheduler.status();
       expect(status.jobs.find((row) => row.jobId === actual.jobId)?.status).toBe("running");
       expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
@@ -540,7 +485,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await scheduler.submit(source);
     await expect(scheduler.claimProvisioning(source.jobId)).resolves.toMatchObject({ kind: "provision" });
     await scheduler.workflowJobCompleted(source.jobId);
-    await expect(scheduler.canStart(source.jobId)).resolves.toBe(false);
+    await expect(scheduler.canStart(source.jobId, source.runnerName)).resolves.toBe(false);
     await expect(scheduler.claimProvisioning(source.jobId)).resolves.toEqual({ kind: "cancelled" });
     const status = await scheduler.status();
     expect(status.jobs.find((row) => row.jobId === source.jobId)?.status).toBe("completed");
@@ -615,5 +560,203 @@ describe("AccountRunnerScheduler stopped runners", () => {
         fetch.mockRestore();
       }
     });
+  });
+
+  it.each([
+    { failure: "start failure", jobId: "2000" },
+    { failure: "lost idle stop", jobId: "2001" },
+  ])("reclaims $failure from runtime without a callback and retries queued demand", async ({ failure, jobId }) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("runtime-stop-" + jobId);
+    const source = legacyJob(jobId);
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, Number(jobId));
+    if (failure === "start failure") {
+      await scheduler.provisioningFailed(source.jobId, source.runnerName, "Container start threw");
+    }
+    await setRuntime(source.runnerName, "stopped");
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (_input, init) =>
+          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
+        );
+      try {
+        await instance.alarm();
+        expect(
+          state.storage.sql
+            .exec(
+              "SELECT reserved, container_stop_reason FROM scheduler_jit_runners WHERE runner_name = ?",
+              source.runnerName,
+            )
+            .toArray(),
+        ).toEqual([{ reserved: 0, container_stop_reason: "runtime-not-running" }]);
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", source.jobId);
+        await instance.alarm();
+        await instance.provisioningFailed(source.jobId, source.runnerName, "late failure from old Workflow");
+        expect(
+          state.storage.sql
+            .exec("SELECT runner_name, status FROM scheduler_jobs WHERE job_id = ?", source.jobId)
+            .toArray(),
+        ).toEqual([{ runner_name: source.runnerName + "-r2", status: "admitted" }]);
+        expect(
+          state.storage.sql
+            .exec("SELECT reserved FROM scheduler_jit_runners WHERE runner_name = ?", source.runnerName + "-r2")
+            .toArray(),
+        ).toEqual([{ reserved: 1 }]);
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+  });
+
+  it("retries the source demand when its crossed runner exits without onStop", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("crossed-runtime-stop");
+    const source = legacyJob("2100");
+    const actual = legacyJob("2101");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 21_000);
+    await scheduler.submit(actual);
+    await scheduler.workflowJobStarted({
+      jobId: actual.jobId,
+      runnerName: source.runnerName,
+      target: legacyTarget,
+      profile,
+    });
+    await scheduler.workflowJobCompleted(actual.jobId, source.runnerName);
+    await setRuntime(source.runnerName, "stopped");
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi
+        .spyOn(globalThis, "fetch")
+        .mockImplementation(async (_input, init) =>
+          init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" }),
+        );
+      try {
+        await instance.alarm();
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", source.jobId);
+        await instance.alarm();
+        expect(
+          state.storage.sql
+            .exec("SELECT runner_name, status FROM scheduler_jobs WHERE job_id = ?", source.jobId)
+            .toArray(),
+        ).toEqual([{ runner_name: source.runnerName + "-r2", status: "admitted" }]);
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+  });
+
+  it("retries an expired admission with a fresh identity before any Workflow claims it", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("expired-admission");
+    const source = legacyJob("2150");
+    await scheduler.submit(source);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ status: "queued" }));
+      try {
+        state.storage.sql.exec("UPDATE scheduler_jit_runners SET provisioning_deadline = 0");
+        await instance.alarm();
+        expect((await instance.status()).jobs.find((row) => row.jobId === source.jobId)?.status).toBe(
+          "stopped-awaiting-completion",
+        );
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", source.jobId);
+        await instance.alarm();
+        await expect(instance.claimProvisioning(source.jobId)).resolves.toMatchObject({
+          kind: "provision",
+          runnerName: source.runnerName + "-r2",
+        });
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+  });
+
+  it("records a crossed assignment before yielding to cancel its unused runner", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("stop-during-crossed-assignment");
+    const source = legacyJob("2160");
+    const actual = legacyJob("2161");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 21_600);
+    await scheduler.submit(actual);
+    await runInDurableObject(scheduler, async (instance) => {
+      const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+      try {
+        const started = instance.workflowJobStarted({
+          jobId: actual.jobId,
+          runnerName: source.runnerName,
+          target: legacyTarget,
+          profile,
+        });
+        await instance.runnerStopped(source.runnerName, { exitCode: 1, reason: "exit during assignment" });
+        await started;
+        expect((await instance.status()).jobs.find((row) => row.jobId === actual.jobId)?.status).toBe(
+          "stopped-awaiting-completion",
+        );
+      } finally {
+        fetch.mockRestore();
+      }
+    });
+  });
+
+  it("rejects configuration and start acknowledgments from a retired provisioning attempt", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("stale-configuration-attempt");
+    const source = legacyJob("2170");
+    await scheduler.submit(source);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'provisioning', runner_name = ? WHERE job_id = ?",
+        source.runnerName + "-r2",
+        source.jobId,
+      );
+      state.storage.sql.exec(
+        "UPDATE scheduler_slots SET configuration_state = 'configuring', configuration_owner_job_id = ? WHERE slot_id = 'preset:standard-3'",
+        source.jobId,
+      );
+      await expect(instance.canStart(source.jobId, source.runnerName)).resolves.toBe(false);
+      await expect(instance.configurationReady(source.jobId, source.runnerName, 0)).resolves.toEqual([]);
+      expect(
+        (await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.configurationState,
+      ).toBe("configuring");
+    });
+  });
+
+  it("ignores an old failure when demand changes while that runner is being retired", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("failure-during-replacement");
+    const source = legacyJob("2180");
+    await scheduler.submit(source);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const failure = instance.provisioningFailed(source.jobId, source.runnerName, "old attempt failed");
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'provisioning', runner_name = ? WHERE job_id = ?",
+        source.runnerName + "-r2",
+        source.jobId,
+      );
+      await failure;
+      expect((await instance.status()).jobs.find((row) => row.jobId === source.jobId)?.status).toBe("provisioning");
+    });
+  });
+
+  it("keeps a running container after completion and retries failed runtime reads", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("runtime-live-and-unavailable");
+    const source = legacyJob("2200");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 22_000);
+    await scheduler.workflowJobStarted({
+      jobId: source.jobId,
+      runnerName: source.runnerName,
+      target: legacyTarget,
+      profile,
+    });
+    await scheduler.workflowJobCompleted(source.jobId, source.runnerName);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      state.storage.sql.exec("UPDATE scheduler_jobs SET updated_at = 0 WHERE job_id = ?", source.jobId);
+      await instance.alarm();
+      expect((await instance.status()).slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(
+        1,
+      );
+    });
+    await setRuntime(source.runnerName, "error");
+    await runInDurableObject(scheduler, (instance) => instance.alarm());
+    const status = await scheduler.status();
+    expect(status.slots.find((slot) => slot.slotId === "preset:standard-3")?.reservedCount).toBe(1);
+    expect(status.events.some((event) => event.kind === "runner-runtime-reconciliation-retry")).toBe(true);
   });
 });

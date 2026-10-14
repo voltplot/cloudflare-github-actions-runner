@@ -30,7 +30,7 @@ async function fetchStatus(account: string, since?: string): Promise<Response> {
   return response;
 }
 
-it("returns all scheduler events since a timestamp while the default stays at 100", async () => {
+it("returns retained scheduler history since a timestamp while the default stays at 100", async () => {
   const account = `scheduler-status-${crypto.randomUUID()}`;
   const scheduler = env.RUNNER_SCHEDULER.getByName(account);
   await scheduler.status();
@@ -83,4 +83,24 @@ it("checks setup authorization before validating since and rejects invalid times
   for (const [index, response] of responses.entries()) {
     expect(response.status, `since=${JSON.stringify(invalid[index])}`).toBe(400);
   }
+});
+
+it("prunes incident history to the latest 1000 events and bounds since responses", async () => {
+  const account = "scheduler-status-retention";
+  const scheduler = env.RUNNER_SCHEDULER.getByName(account);
+  await scheduler.status();
+  await runInDurableObject(scheduler, (_instance, state) => {
+    for (let index = 0; index < 1005; index += 1) {
+      state.storage.sql.exec("INSERT INTO scheduler_events (kind, created_at) VALUES ('retention', ?)", index);
+    }
+  });
+  const response = await fetchStatus(account, "0");
+  const history = eventsSchema.parse(await response.json());
+  expect(history.events).toHaveLength(1000);
+  expect(history.events.at(-1)?.createdAt).toBe(5);
+  await runInDurableObject(scheduler, (_instance, state) => {
+    expect(state.storage.sql.exec("SELECT COUNT(*) AS count FROM scheduler_events").toArray()).toEqual([
+      { count: 1000 },
+    ]);
+  });
 });

@@ -57,7 +57,7 @@ it("keeps runner ownership when the trace assignment write fails", async () => {
     await state.storage.deleteAlarm();
   });
   await scheduler.runnerProvisioned(displacedJobId, runnerName, 7_001);
-  await scheduler.runnerStarted(runnerName);
+  await env.RUNNER_STANDARD_3.getByName(runnerName).fetch("https://runtime/running", { method: "POST" });
 
   // GitHub gives the displaced job's runner another job while D1 is full.
   const full = (): never => {

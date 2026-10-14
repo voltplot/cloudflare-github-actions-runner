@@ -1,4 +1,4 @@
-import { Container, ContainerProxy } from "@cloudflare/containers";
+import { Container, ContainerProxy, getContainer, type State } from "@cloudflare/containers";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { z } from "zod";
 
@@ -20,6 +20,7 @@ import {
   type GitHubRepositoryTarget,
 } from "./github-repository";
 import { provisionRunner } from "./provision";
+import { RunnerLifetime } from "./runner-lifetime";
 import { RunnerProvisioningWorkflow, startRunnerProvisioningWorkflows } from "./runner-provisioning-workflow";
 import type { WorkerEnvironment } from "./environment";
 import {
@@ -41,7 +42,6 @@ import {
   inspectRunnerResourceOwnership,
   recordRunnerResourceOwnership,
 } from "./runner-resource-ownership";
-import { runnerContainerFor } from "./runner-container-router";
 import {
   RunnerEligibilityCheck,
   runnerEligibilityFor,
@@ -167,20 +167,40 @@ function json<const Body>(body: Body, status = 200): Response {
 
 abstract class GitHubActionsRunnerContainer extends Container<WorkerEnvironment> {
   enableInternet = true;
+  // Synchronous KV fences delayed starts without holding a gate across SDK startup.
+  // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#synchronous-kv-api
+  private readonly lifetime = new RunnerLifetime(
+    {
+      retired: () => this.ctx.storage.kv.get("runner-retired") === true,
+      retire: () => this.ctx.storage.kv.put("runner-retired", true),
+    },
+    () => this.ctx.container?.running === true,
+  );
+
+  // https://developers.cloudflare.com/containers/api/durable-object-container/#running
+  override async getState(): Promise<State> {
+    return {
+      status: this.lifetime.active() ? "running" : "stopped",
+      lastChange: Date.now(),
+    };
+  }
+
+  override start(...args: Parameters<Container<WorkerEnvironment>["start"]>): Promise<void> {
+    return this.lifetime.start(() => super.start(...args));
+  }
+
+  reconcile(provisioningDeadline: number): ReturnType<RunnerLifetime["reconcile"]> {
+    return this.lifetime.reconcile(provisioningDeadline);
+  }
 
   private runnerName(): string | undefined {
     return this.ctx.id.name;
   }
 
-  override async onStart(): Promise<void> {
-    const runnerName = this.runnerName();
-    if (runnerName === undefined) {
+  override async onStop({ exitCode, reason }: { exitCode: number; reason: string }): Promise<void> {
+    if (this.lifetime.reconcile(0) !== "stopped") {
       return;
     }
-    await this.env.RUNNER_SCHEDULER.getByName(this.env.CLOUDFLARE_ACCOUNT_ID).runnerStarted(runnerName);
-  }
-
-  override async onStop({ exitCode, reason }: { exitCode: number; reason: string }): Promise<void> {
     const runnerName = this.runnerName();
     if (runnerName === undefined) {
       return;
@@ -281,7 +301,7 @@ export async function startInvalidRunner(
   const result = await provisionRunner(
     env,
     { ...target, token },
-    runnerContainerFor(env, "validation", decision.runnerName),
+    getContainer(env.RUNNER_VALIDATION, decision.runnerName),
     decision.runnerName,
     RUNNER_PROFILES.basic,
     {

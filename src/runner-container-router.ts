@@ -1,12 +1,9 @@
 import { getContainer } from "@cloudflare/containers";
 
 import type { WorkerEnvironment } from "./environment";
-import type { RunnerContainer } from "./provision";
 
-export function runnerContainerFor(env: WorkerEnvironment, slotId: string, runnerName: string): RunnerContainer {
+export function runnerContainerFor(env: WorkerEnvironment, slotId: string, runnerName: string) {
   switch (slotId) {
-    case "validation":
-      return getContainer(env.RUNNER_VALIDATION, runnerName);
     case "preset:lite":
       return getContainer(env.RUNNER_LITE, runnerName);
     case "preset:basic":

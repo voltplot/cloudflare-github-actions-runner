@@ -1,6 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 
+import { runnerContainerFor } from "./runner-container-router";
+import type { RunnerLifetime } from "./runner-lifetime";
+
 import { prepareRunnerApplication, reconcileRunnerApplicationCapacity } from "./cloudflare-containers";
 import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
@@ -26,11 +29,9 @@ import {
 } from "./scheduler-policy";
 
 const SCHEDULER_ALARM_DELAY_MS = 60_000;
+const RUNNER_PROVISIONING_TIMEOUT_MS = 20 * 60_000;
+const SCHEDULER_EVENT_LIMIT = 1_000;
 const RUNNER_COMPLETION_GRACE_MS = 30_000;
-// GitHub can deliver workflow_job: completed before actions/cache finishes its
-// post-job upload through the runner's local results proxy. Keep the one-job
-// runner-to-cache mapping briefly after Container shutdown for that finalizer.
-const RUNNER_CACHE_POST_JOB_GRACE_MS = 5 * 60_000;
 const RUNNER_CLEANUP_RETRY_MS = 60_000;
 const STALLED_CAPACITY_UPDATE_RECOVERY_MS = 60_000;
 const ACTIVE_JOB_STATES = ["admitted", "provisioning", "running", "releasing", "stopped-awaiting-completion"] as const;
@@ -46,33 +47,16 @@ type JobStatus =
   | "cancelled"
   | "failed";
 
-const activeJobStates = new Set<JobStatus>(ACTIVE_JOB_STATES);
-
 type SlotConfigurationState = "ready" | "configuring" | "idle";
 
-type SchedulerEventDetailScalar = boolean | number | string | null;
-type SchedulerEventDetailValue = SchedulerEventDetailScalar | readonly SchedulerEventDetailScalar[];
-
-interface SchedulerEventDetail {
-  readonly [property: string]: SchedulerEventDetailValue | undefined;
-}
-
-type SchedulerEventData = SchedulerEventDetail | string | null;
-
+const schedulerEventScalarSchema = z.union([z.boolean(), z.number(), z.string(), z.null()]);
 const schedulerEventDetailSchema = z.union([
   z.string(),
   z.null(),
-  z.record(
-    z.string(),
-    z.union([
-      z.boolean(),
-      z.number(),
-      z.string(),
-      z.null(),
-      z.array(z.union([z.boolean(), z.number(), z.string(), z.null()])),
-    ]),
-  ),
+  z.record(z.string(), z.union([schedulerEventScalarSchema, z.array(schedulerEventScalarSchema)])),
 ]);
+type SchedulerEventData = z.infer<typeof schedulerEventDetailSchema>;
+type SchedulerEventDetail = Partial<Exclude<SchedulerEventData, string | null>>;
 
 interface JobRow {
   [column: string]: ArrayBuffer | number | string | null;
@@ -144,22 +128,33 @@ interface SchedulerEventRow {
   created_at: number;
 }
 
-/**
- * A JIT runner has a durable identity of its own. Keep it separate from its
- * source job: GitHub may assign two compatible runners to each other's jobs,
- * and processing one assignment must not erase the other runner's mapping.
- */
+/** Reservations follow runtime identities, independent of the jobs GitHub assigns. */
 interface JitRunnerRow {
   [column: string]: ArrayBuffer | number | string | null;
   runner_name: string;
   source_job_id: string;
   github_owner: string;
   github_repository: string;
+  github_installation_id: number | null;
   profile_key: string;
+  slot_id: string;
+  reserved: number;
+  provisioning_deadline: number;
+  runner_id: number | null;
+  container_stopped_at: number | null;
+  container_exit_code: number | null;
+  container_stop_reason: string | null;
+  runner_cleanup_state: "none" | "retry" | "done";
+  runner_cleanup_due_at: number | null;
+  runner_cleanup_attempts: number;
   assigned_job_id: string | null;
   assignment_observed: number;
   created_at: number;
   updated_at: number;
+}
+
+interface StoppedJitRunnerRow extends JitRunnerRow {
+  container_stopped_at: number;
 }
 
 interface ResourceTotals {
@@ -275,10 +270,6 @@ export interface SchedulerStatus {
   }>;
 }
 
-function now(): number {
-  return Date.now();
-}
-
 function customApplicationName(env: WorkerEnvironment, slotNumber: number): string {
   return slotNumber === 1 ? env.CUSTOM_RUNNER_APPLICATION : `${env.CUSTOM_RUNNER_APPLICATION}-${slotNumber}`;
 }
@@ -327,33 +318,32 @@ function isSlotConfigurationState(value: string): value is SlotConfigurationStat
   return value === "ready" || value === "configuring" || value === "idle";
 }
 
-function jobMatchesRunnerClaim(job: JobRow, input: SchedulerRunnerClaimInput): boolean {
+function matchesRunner(
+  row: Pick<JobRow, "github_owner" | "github_repository" | "profile_key">,
+  target: GitHubRepositoryTarget,
+  profileKey: string,
+): boolean {
   return (
-    job.github_owner.toLowerCase() === input.target.owner.toLowerCase() &&
-    job.github_repository.toLowerCase() === input.target.repository.toLowerCase() &&
-    job.profile_key === input.profile.key
+    row.github_owner.toLowerCase() === target.owner.toLowerCase() &&
+    row.github_repository.toLowerCase() === target.repository.toLowerCase() &&
+    row.profile_key === profileKey
   );
 }
 
-/**
- * One scheduler exists per Cloudflare account. The account is deliberately the
- * coordination atom: all capacity reservations for this runner service live in
- * one SQLite-backed Durable Object. Its alarm serializes Cloudflare capacity
- * mutations, while Workflows handle only runner start and rollout polling.
- */
+/** One SQLite-backed Durable Object serializes account-wide capacity mutations. */
 export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   constructor(ctx: DurableObjectState, env: WorkerEnvironment) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      this.initializeSchema();
-      this.initializeSlots();
-      this.reconcileSlotReservations();
-      this.releaseCompletedJobsAwaitingContainerStop();
-      this.scheduleReleaseRecoveries();
+      // https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#transactions
+      ctx.storage.transactionSync(() => {
+        this.initializeSchema();
+        this.initializeSlots();
+        this.reconcileSlotReservations();
+        this.pruneEvents();
+      });
       this.recoverStalledCapacityUpdates();
-      // A Worker deployment can reset an in-flight scheduler invocation. Re-arm
-      // the persisted alarm while reconstructing the DO so queued capacity
-      // changes and recovery work continue without another GitHub delivery.
+      // Deployments can interrupt work; reconstruction must re-arm the persisted alarm.
       await this.scheduleWorkAlarmIfNeeded();
     });
   }
@@ -450,43 +440,19 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         ON scheduler_jit_runners(assigned_job_id, assignment_observed, updated_at);
     `);
 
-    const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_slots)");
-    if (!columns.some((column) => column.name === "applied_max_instances")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN applied_max_instances INTEGER NOT NULL DEFAULT 1",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_debounce_until")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_debounce_until INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_update_in_progress")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_update_in_progress INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_update_generation")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_update_generation INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    const slotColumnMigrations = [
+    this.addColumns("scheduler_slots", [
+      ["applied_max_instances", "INTEGER NOT NULL DEFAULT 1"],
+      ["capacity_debounce_until", "INTEGER NOT NULL DEFAULT 0"],
+      ["capacity_update_in_progress", "INTEGER NOT NULL DEFAULT 0"],
+      ["capacity_update_generation", "INTEGER NOT NULL DEFAULT 0"],
       ["pending_profile_key", "TEXT"],
       ["pending_vcpu", "REAL"],
       ["pending_memory_mib", "INTEGER"],
       ["pending_disk_mb", "INTEGER"],
       ["capacity_reclaim_pending", "INTEGER NOT NULL DEFAULT 0"],
       ["last_released_at", "INTEGER NOT NULL DEFAULT 0"],
-    ] as const;
-    for (const [name, definition] of slotColumnMigrations) {
-      if (!columns.some((column) => column.name === name)) {
-        this.ctx.storage.sql.exec(`ALTER TABLE scheduler_slots ADD COLUMN ${name} ${definition}`);
-      }
-    }
-
-    const jobColumns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jobs)");
-    const jobColumnMigrations = [
+    ]);
+    this.addColumns("scheduler_jobs", [
       ["github_owner", "TEXT NOT NULL DEFAULT ''"],
       ["github_repository", "TEXT NOT NULL DEFAULT ''"],
       ["head_sha", "TEXT NOT NULL DEFAULT ''"],
@@ -504,12 +470,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["runner_cleanup_state", "TEXT NOT NULL DEFAULT 'none'"],
       ["runner_cleanup_due_at", "INTEGER"],
       ["runner_cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"],
-    ] as const;
-    for (const [name, definition] of jobColumnMigrations) {
-      if (!jobColumns.some((column) => column.name === name)) {
-        this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jobs ADD COLUMN ${name} ${definition}`);
-      }
-    }
+    ]);
     // Jobs that were queued before the pool became multi-repository belong to
     // the original POC repository and must retain a usable cleanup credential.
     if (this.env.LEGACY_GITHUB_OWNER !== undefined && this.env.LEGACY_GITHUB_REPOSITORY !== undefined) {
@@ -521,6 +482,105 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         this.env.LEGACY_GITHUB_REPOSITORY,
       );
     }
+    this.initializeRunnerReservations();
+  }
+
+  private addColumns(
+    table: "scheduler_slots" | "scheduler_jobs",
+    migrations: readonly (readonly [string, string])[],
+  ): void {
+    const columns = new Set(this.rows<{ name: string }>(`PRAGMA table_info(${table})`).map((column) => column.name));
+    for (const [name, definition] of migrations) {
+      if (!columns.has(name)) {
+        this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      }
+    }
+  }
+
+  private initializeRunnerReservations(): void {
+    const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jit_runners)");
+    if (!columns.some((column) => column.name === "provisioning_deadline")) {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE scheduler_jit_runners ADD COLUMN provisioning_deadline INTEGER NOT NULL DEFAULT 0",
+      );
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET provisioning_deadline = updated_at + ?",
+        RUNNER_PROVISIONING_TIMEOUT_MS,
+      );
+    }
+    if (columns.some((column) => column.name === "reserved")) {
+      return;
+    }
+    const migrations = [
+      ["slot_id", "TEXT NOT NULL DEFAULT ''"],
+      ["reserved", "INTEGER NOT NULL DEFAULT 1"],
+      ["runner_id", "INTEGER"],
+      ["github_installation_id", "INTEGER"],
+      ["container_stopped_at", "INTEGER"],
+      ["container_exit_code", "INTEGER"],
+      ["container_stop_reason", "TEXT"],
+      ["runner_cleanup_state", "TEXT NOT NULL DEFAULT 'none'"],
+      ["runner_cleanup_due_at", "INTEGER"],
+      ["runner_cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"],
+    ] as const;
+    for (const [name, definition] of migrations) {
+      this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jit_runners ADD COLUMN ${name} ${definition}`);
+    }
+    // Legacy assignments can overwrite the source job's runner identity.
+    for (const runner of this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners")) {
+      const source = this.job(runner.source_job_id);
+      if (source === undefined) {
+        this.releaseLegacyRunnerReservation(runner.runner_name, "missing-source-job");
+        continue;
+      }
+      const creation = this.rows<{ slot_id: string | null; runner_id: number | null }>(
+        `SELECT slot_id, json_extract(detail_json, '$.runnerId') AS runner_id
+         FROM scheduler_events WHERE kind = 'jit-runner-created' AND job_id = ? AND created_at >= ?
+         ORDER BY created_at, event_id LIMIT 1`,
+        runner.source_job_id,
+        runner.created_at,
+      )[0];
+      const sameRunner = source.runner_name === runner.runner_name;
+      const runnerId = (sameRunner ? source.runner_id : null) ?? creation?.runner_id ?? null;
+      const stoppedAt = sameRunner ? source.container_stopped_at : null;
+      const slotId =
+        creation?.slot_id ??
+        (sameRunner ? source.slot_id : null) ??
+        (RUNNER_PROFILE_KEYS.some((key) => key === runner.profile_key) ? `preset:${runner.profile_key}` : null);
+      if (slotId === null || this.slot(slotId) === undefined) {
+        this.releaseLegacyRunnerReservation(runner.runner_name, "missing-slot");
+        continue;
+      }
+      this.ctx.storage.sql.exec(
+        `UPDATE scheduler_jit_runners
+         SET slot_id = ?, runner_id = ?, github_installation_id = ?, reserved = ?,
+             container_stopped_at = ?, container_exit_code = ?, container_stop_reason = ?,
+             runner_cleanup_state = ?, runner_cleanup_due_at = ?, runner_cleanup_attempts = ?
+         WHERE runner_name = ?`,
+        slotId,
+        runnerId,
+        source.github_installation_id,
+        stoppedAt === null ? 1 : 0,
+        stoppedAt,
+        sameRunner ? source.container_exit_code : null,
+        sameRunner ? source.container_stop_reason : null,
+        sameRunner ? source.runner_cleanup_state : "none",
+        sameRunner ? source.runner_cleanup_due_at : null,
+        sameRunner ? source.runner_cleanup_attempts : 0,
+        runner.runner_name,
+      );
+    }
+    for (const job of this.rows<JobRow>(
+      `SELECT * FROM scheduler_jobs WHERE status IN (${activeStatusList()}) AND slot_id IS NOT NULL`,
+      ...ACTIVE_JOB_STATES,
+    )) {
+      this.reserveRunner(job, job.slot_id ?? "");
+    }
+  }
+
+  private releaseLegacyRunnerReservation(runnerName: string, reason: string): void {
+    this.ctx.storage.sql.exec("UPDATE scheduler_jit_runners SET reserved = 0 WHERE runner_name = ?", runnerName);
+    this.recordEvent("legacy-runner-reservation-released", { detail: { runnerName, reason } });
   }
 
   private initializeSlots(): void {
@@ -599,7 +659,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       options.slotId ?? null,
       kind,
       options.detail === undefined ? null : JSON.stringify(options.detail),
-      now(),
+      Date.now(),
     );
   }
 
@@ -611,19 +671,44 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return this.rows<SlotRow>("SELECT * FROM scheduler_slots WHERE slot_id = ?", slotId)[0];
   }
 
+  private pruneEvents(): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM scheduler_events WHERE event_id < (SELECT event_id FROM scheduler_events ORDER BY event_id DESC LIMIT 1 OFFSET ?)",
+      SCHEDULER_EVENT_LIMIT - 1,
+    );
+  }
+
+  private reserveRunner(job: JobRow, slotId: string): void {
+    this.ctx.storage.sql.exec(
+      `INSERT OR IGNORE INTO scheduler_jit_runners
+       (runner_name, source_job_id, github_owner, github_repository, profile_key, slot_id,
+        github_installation_id, created_at, updated_at, provisioning_deadline)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      job.runner_name,
+      job.job_id,
+      job.github_owner,
+      job.github_repository,
+      job.profile_key,
+      slotId,
+      job.github_installation_id,
+      Date.now(),
+      Date.now(),
+      Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
+    );
+  }
+
+  private runner(runnerName: string): JitRunnerRow | undefined {
+    return this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE runner_name = ?", runnerName)[0];
+  }
+
   private reservedResources(): ResourceTotals {
-    const row = this.rows<{ vcpu: number | null; memory_mib: number | null; disk_mb: number | null }>(
-      `SELECT COALESCE(SUM(vcpu), 0) AS vcpu,
-              COALESCE(SUM(memory_mib), 0) AS memory_mib,
-              COALESCE(SUM(disk_mb), 0) AS disk_mb
-       FROM scheduler_jobs WHERE status IN (${activeStatusList()})`,
-      ...ACTIVE_JOB_STATES,
+    const row = this.rows<{ vcpu: number; memory_mib: number; disk_mb: number }>(
+      `SELECT COALESCE(SUM(j.vcpu), 0) AS vcpu, COALESCE(SUM(j.memory_mib), 0) AS memory_mib,
+              COALESCE(SUM(j.disk_mb), 0) AS disk_mb
+       FROM scheduler_jit_runners r JOIN scheduler_jobs j ON j.job_id = r.source_job_id
+       WHERE r.reserved = 1`,
     )[0];
-    return {
-      vcpu: row?.vcpu ?? 0,
-      memoryMib: row?.memory_mib ?? 0,
-      diskMb: row?.disk_mb ?? 0,
-    };
+    return { vcpu: row?.vcpu ?? 0, memoryMib: row?.memory_mib ?? 0, diskMb: row?.disk_mb ?? 0 };
   }
 
   private canReserve(profile: RunnerProfile): boolean {
@@ -643,10 +728,6 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       capacityUpdateInProgress: slot.capacity_update_in_progress !== 0,
       lastReleasedAt: slot.last_released_at,
     }));
-  }
-
-  private configuredResources(): ResourceTotals {
-    return configuredCapacity(this.configuredCapacitySlots());
   }
 
   private capacityPlan(
@@ -791,7 +872,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       return [];
     }
 
-    const timestamp = now();
+    const timestamp = Date.now();
     this.scheduleCapacityReclamation(capacityPlan.reductions, timestamp);
     const nextGeneration = selected.slot.capacity_generation + 1;
     const configuring = selected.requiresConfiguration || selected.slot.configuration_state === "configuring";
@@ -839,6 +920,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       timestamp,
       next.job_id,
     );
+    this.reserveRunner(next, selected.slot.slot_id);
     this.recordEvent("scheduler-admitted", {
       jobId: next.job_id,
       slotId: selected.slot.slot_id,
@@ -875,7 +957,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
 
   private async scheduleWorkAlarmIfNeeded(): Promise<void> {
     const work = this.rows<{ count: number }>(
-      "SELECT COUNT(*) AS count FROM scheduler_jobs WHERE status IN ('queued', 'admitted')",
+      "SELECT (SELECT COUNT(*) FROM scheduler_jobs WHERE status IN ('queued', 'admitted')) + (SELECT COUNT(*) FROM scheduler_jit_runners WHERE reserved = 1) AS count",
     )[0];
     const capacityChange = this.rows<{ earliest_due: number | null }>(
       `SELECT MIN(capacity_debounce_until) AS earliest_due
@@ -885,29 +967,31 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          AND desired_max_instances != applied_max_instances`,
     )[0];
     const recovery = this.rows<{ earliest_due: number | null }>(
-      `SELECT MIN(due_at) AS earliest_due
-       FROM (
-         SELECT recovery_due_at AS due_at
-         FROM scheduler_jobs
+      `SELECT MIN(due_at) AS earliest_due FROM (
+         SELECT recovery_due_at AS due_at FROM scheduler_jobs
          WHERE status = 'stopped-awaiting-completion' AND recovery_due_at IS NOT NULL
          UNION ALL
-         SELECT runner_cleanup_due_at AS due_at
-         FROM scheduler_jobs
-         WHERE runner_cleanup_state = 'retry' AND runner_cleanup_due_at IS NOT NULL
+         SELECT runner_cleanup_due_at AS due_at FROM scheduler_jit_runners
+         WHERE container_stopped_at IS NOT NULL AND runner_cleanup_state = 'retry' AND runner_cleanup_due_at IS NOT NULL
          UNION ALL
-         SELECT recovery_due_at AS due_at
-         FROM scheduler_jobs
-         WHERE status = 'releasing' AND recovery_due_at IS NOT NULL
+         SELECT updated_at AS due_at FROM scheduler_jit_runners
+         WHERE container_stopped_at IS NOT NULL AND runner_cleanup_state = 'none'
        )`,
     )[0];
-    const recoveryDue = (work?.count ?? 0) > 0 ? now() + SCHEDULER_ALARM_DELAY_MS : undefined;
+    const recoveryDue = (work?.count ?? 0) > 0 ? Date.now() + SCHEDULER_ALARM_DELAY_MS : undefined;
     const scheduledDue = [capacityChange?.earliest_due, recovery?.earliest_due, recoveryDue].filter(
       (due): due is number => due !== null && due !== undefined,
     );
-    const nextAlarm = scheduledDue.length === 0 ? undefined : Math.max(now(), Math.min(...scheduledDue));
+    const nextAlarm = scheduledDue.length === 0 ? undefined : Math.max(Date.now(), Math.min(...scheduledDue));
     if (nextAlarm !== undefined) {
       await this.ctx.storage.setAlarm(nextAlarm);
     }
+  }
+
+  private async admitAndSchedule(): Promise<SchedulerAdmission[]> {
+    const admissions = this.admitNext();
+    await this.scheduleWorkAlarmIfNeeded();
+    return admissions;
   }
 
   async submit(job: SchedulerJobInput): Promise<SchedulerResult> {
@@ -915,16 +999,15 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (existing !== undefined) {
       if (existing.head_sha === "" && job.headSha !== "") {
         this.ctx.storage.sql.exec(
-          "UPDATE scheduler_jobs SET head_sha = ?, updated_at = ? WHERE job_id = ? AND head_sha = ''",
+          "UPDATE scheduler_jobs SET head_sha = ? WHERE job_id = ? AND head_sha = ''",
           job.headSha,
-          now(),
           job.jobId,
         );
       }
       return { accepted: true, queueReason: this.queueReason(existing), admissions: [] };
     }
 
-    const timestamp = now();
+    const timestamp = Date.now();
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduler_jobs
        (job_id, runner_name, github_owner, github_repository, head_sha, worker_origin, github_installation_id, cache_scope, cache_fallback_scope, cache_write_allowed, profile_json, profile_key, vcpu, memory_mib, disk_mb, status,
@@ -962,8 +1045,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       },
     });
 
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
+    const admissions = await this.admitAndSchedule();
     const stored = this.job(job.jobId);
     return { accepted: true, queueReason: stored === undefined ? undefined : this.queueReason(stored), admissions };
   }
@@ -973,92 +1055,82 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (job === undefined) {
       return { kind: "missing" };
     }
-    if (job.status === "queued" || job.status === "admitted") {
-      if (job.slot_id === null) {
-        return { kind: "wait" };
-      }
-      const slot = this.slot(job.slot_id);
-      if (slot === undefined) {
-        return { kind: "missing" };
-      }
-      if (slot.configuration_state === "configuring" && slot.configuration_owner_job_id !== jobId) {
-        return { kind: "wait" };
-      }
-      const ownsConfiguration = slot.configuration_state === "configuring" && slot.configuration_owner_job_id === jobId;
-      if (
-        slot.capacity_reclaim_pending !== 0 ||
-        slot.capacity_update_in_progress !== 0 ||
-        (!ownsConfiguration && slot.applied_max_instances < slot.desired_max_instances)
-      ) {
-        return { kind: "wait" };
-      }
+    if (
+      job.github_assignment_observed !== 0 ||
+      job.status === "completed" ||
+      job.status === "cancelled" ||
+      job.status === "failed"
+    ) {
+      await this.cancelPendingRunner(job.runner_name);
+      await this.scheduleWorkAlarmIfNeeded();
+      return { kind: "cancelled" };
+    }
+    const pending = job.status === "queued" || job.status === "admitted";
+    if (!pending && job.status !== "provisioning" && job.status !== "running") {
+      return { kind: "cancelled" };
+    }
+    if (job.slot_id === null) {
+      return { kind: pending ? "wait" : "missing" };
+    }
+    const slot = this.slot(job.slot_id);
+    if (slot === undefined) {
+      return { kind: "missing" };
+    }
+    const configuring = pending && slot.configuration_state === "configuring";
+    if (
+      (configuring && slot.configuration_owner_job_id !== jobId) ||
+      slot.capacity_reclaim_pending !== 0 ||
+      slot.capacity_update_in_progress !== 0 ||
+      (!configuring && slot.applied_max_instances < slot.desired_max_instances)
+    ) {
+      return { kind: "wait" };
+    }
+    if (pending) {
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_jobs SET status = 'provisioning', updated_at = ? WHERE job_id = ?",
-        now(),
+        Date.now(),
         jobId,
       );
-      const profile = parseProfile(job.profile_json);
-      return {
-        kind: "provision",
-        jobId,
-        headSha: job.head_sha,
-        runnerName: job.runner_name,
-        target: { owner: job.github_owner, repository: job.github_repository },
-        workerOrigin: job.worker_origin,
-        cacheScope:
-          job.cache_scope === ""
-            ? undefined
-            : storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
-        installationId: job.github_installation_id,
-        profile,
-        slotId: slot.slot_id,
-        applicationName: slot.application_name,
-        requiredMaxInstances: Math.max(1, slot.reserved_count),
-        capacityGeneration: slot.capacity_generation,
-        requiresConfiguration: slot.configuration_state === "configuring" && slot.configuration_owner_job_id === jobId,
-      };
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET provisioning_deadline = ? WHERE runner_name = ? AND reserved = 1",
+        Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
+        job.runner_name,
+      );
     }
-    if (job.status === "provisioning" || job.status === "running") {
-      if (job.slot_id === null) {
-        return { kind: "missing" };
-      }
-      const slot = this.slot(job.slot_id);
-      if (slot === undefined) {
-        return { kind: "missing" };
-      }
-      if (
-        slot.capacity_reclaim_pending !== 0 ||
-        slot.capacity_update_in_progress !== 0 ||
-        slot.applied_max_instances < slot.desired_max_instances
-      ) {
-        return { kind: "wait" };
-      }
-      return {
-        kind: "provision",
-        jobId,
-        headSha: job.head_sha,
-        runnerName: job.runner_name,
-        target: { owner: job.github_owner, repository: job.github_repository },
-        workerOrigin: job.worker_origin,
-        cacheScope:
-          job.cache_scope === ""
-            ? undefined
-            : storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
-        installationId: job.github_installation_id,
-        profile: parseProfile(job.profile_json),
-        slotId: slot.slot_id,
-        applicationName: slot.application_name,
-        requiredMaxInstances: Math.max(1, slot.reserved_count),
-        capacityGeneration: slot.capacity_generation,
-        requiresConfiguration: slot.configuration_state === "configuring" && slot.configuration_owner_job_id === jobId,
-      };
-    }
-    return { kind: "cancelled" };
+    return this.provisioningPlan(job, slot);
   }
 
-  async configurationReady(jobId: string): Promise<SchedulerAdmission[]> {
+  private provisioningPlan(job: JobRow, slot: SlotRow): RunnerProvisioningPlan {
+    return {
+      kind: "provision",
+      jobId: job.job_id,
+      headSha: job.head_sha,
+      runnerName: job.runner_name,
+      target: { owner: job.github_owner, repository: job.github_repository },
+      workerOrigin: job.worker_origin,
+      cacheScope:
+        job.cache_scope === ""
+          ? undefined
+          : storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
+      installationId: job.github_installation_id,
+      profile: parseProfile(job.profile_json),
+      slotId: slot.slot_id,
+      applicationName: slot.application_name,
+      requiredMaxInstances: Math.max(1, slot.reserved_count),
+      capacityGeneration: slot.capacity_generation,
+      requiresConfiguration:
+        slot.configuration_state === "configuring" && slot.configuration_owner_job_id === job.job_id,
+    };
+  }
+
+  async configurationReady(jobId: string, runnerName: string, generation: number): Promise<SchedulerAdmission[]> {
     const job = this.job(jobId);
-    if (job === undefined || job.slot_id === null) {
+    if (
+      job === undefined ||
+      job.slot_id === null ||
+      job.runner_name !== runnerName ||
+      !this.runner(runnerName)?.reserved
+    ) {
       return [];
     }
     this.ctx.storage.sql.exec(
@@ -1074,9 +1146,11 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       job.slot_id,
       jobId,
     );
+    if (this.rows<{ changes: number }>("SELECT changes() AS changes")[0]?.changes !== 1) {
+      return [];
+    }
     const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
-    return admissions;
+    return [...admissions, ...(await this.capacityPrepared(job.slot_id, generation))];
   }
 
   async capacityPrepared(slotId: string, generation: number): Promise<SchedulerAdmission[]> {
@@ -1100,14 +1174,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     );
     this.ctx.storage.sql.exec(
       "UPDATE capacity_operations SET state = 'applied', updated_at = ? WHERE slot_id = ? AND generation = ?",
-      now(),
+      Date.now(),
       slotId,
       generation,
     );
     this.ctx.storage.sql.exec(
       `UPDATE capacity_operations SET state = 'superseded', updated_at = ?
        WHERE slot_id = ? AND generation < ? AND state = 'pending'`,
-      now(),
+      Date.now(),
       slotId,
       generation,
     );
@@ -1116,68 +1190,24 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return admissions;
   }
 
-  async canStart(jobId: string): Promise<boolean> {
+  async canStart(jobId: string, runnerName: string): Promise<boolean> {
     const job = this.job(jobId);
-    return job?.status === "provisioning";
+    return job?.status === "provisioning" && job.runner_name === runnerName && this.runner(runnerName)?.reserved === 1;
   }
 
   async runnerProvisioned(jobId: string, runnerName: string, runnerId: number): Promise<void> {
+    const runner = this.runner(runnerName);
+    if (runner === undefined || runner.source_job_id !== jobId || runner.reserved === 0) {
+      throw new Error(`No reservation for JIT runner ${runnerName}`);
+    }
     this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET runner_id = ?, updated_at = ?
-       WHERE job_id = ? AND runner_name = ? AND status = 'provisioning'`,
+      "UPDATE scheduler_jit_runners SET runner_id = ?, updated_at = ?, provisioning_deadline = ? WHERE runner_name = ?",
       runnerId,
-      now(),
-      jobId,
+      Date.now(),
+      Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
       runnerName,
     );
-    // Record every JIT runner, even one whose job completed or moved to another
-    // runner meanwhile: its Container still starts and may take another job.
-    const job = this.job(jobId);
-    if (job === undefined) {
-      return;
-    }
-    const timestamp = now();
-    this.ctx.storage.sql.exec(
-      `INSERT INTO scheduler_jit_runners
-       (runner_name, source_job_id, github_owner, github_repository, profile_key, assigned_job_id, assignment_observed, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)
-       ON CONFLICT(runner_name) DO UPDATE SET
-         source_job_id = excluded.source_job_id,
-         github_owner = excluded.github_owner,
-         github_repository = excluded.github_repository,
-         profile_key = excluded.profile_key,
-         assigned_job_id = NULL,
-         assignment_observed = 0,
-         updated_at = excluded.updated_at`,
-      runnerName,
-      jobId,
-      job.github_owner,
-      job.github_repository,
-      job.profile_key,
-      timestamp,
-      timestamp,
-    );
-    this.recordEvent("jit-runner-created", {
-      jobId,
-      slotId: job?.slot_id ?? undefined,
-      detail: { runnerId },
-    });
-  }
-
-  async runnerStarted(runnerName: string): Promise<void> {
-    const job = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE runner_name = ? AND status = 'provisioning'",
-      runnerName,
-    )[0];
-    this.ctx.storage.sql.exec(
-      "UPDATE scheduler_jobs SET status = 'running', updated_at = ? WHERE runner_name = ? AND status = 'provisioning'",
-      now(),
-      runnerName,
-    );
-    if (job !== undefined) {
-      this.recordEvent("container-started", { jobId: job.job_id, slotId: job.slot_id ?? undefined });
-    }
+    this.recordEvent("jit-runner-created", { jobId, slotId: runner.slot_id, detail: { runnerId, runnerName } });
   }
 
   /**
@@ -1214,9 +1244,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       const assignedJob = this.job(runner.assigned_job_id);
       if (
         assignedJob !== undefined &&
-        assignedJob.github_owner.toLowerCase() === owner.toLowerCase() &&
-        assignedJob.github_repository.toLowerCase() === repo.toLowerCase() &&
-        assignedJob.profile_key === runner.profile_key &&
+        matchesRunner(assignedJob, { owner, repository: repo }, runner.profile_key) &&
         assignedJob.cache_scope !== ""
       ) {
         return {
@@ -1229,597 +1257,386 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         };
       }
     }
-    const job = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE runner_name = ?
-         AND lower(github_owner) = lower(?)
-         AND lower(github_repository) = lower(?)
-         AND (
-           status IN ('provisioning', 'running', 'releasing')
-           OR (status = 'completed' AND updated_at >= ?)
-         )`,
-      runnerName,
-      owner,
-      repo,
-      now() - RUNNER_CACHE_POST_JOB_GRACE_MS,
-    )[0];
-    if (job === undefined || job.github_assignment_observed === 0 || job.cache_scope === "") {
-      return undefined;
-    }
-    return {
-      jobId: job.job_id,
-      cacheScope: storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed),
-    };
+    return undefined;
   }
 
-  /** @deprecated Use cacheAssignment, which follows a JIT runner's actual job. */
   async cacheScope(runnerName: string, repository: string, jobId: string): Promise<SchedulerCacheScope | undefined> {
-    const [owner, repo, extra] = repository.split("/");
-    if (owner === undefined || repo === undefined || extra !== undefined) {
-      return undefined;
-    }
-    const job = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE job_id = ?
-         AND runner_name = ?
-         AND lower(github_owner) = lower(?)
-         AND lower(github_repository) = lower(?)
-         AND status IN ('provisioning', 'running', 'releasing')`,
-      jobId,
-      runnerName,
-      owner,
-      repo,
-    )[0];
-    if (job === undefined || job.github_assignment_observed === 0 || job.cache_scope === "") {
-      return undefined;
-    }
-    return storedCacheScope(job.cache_scope, job.cache_fallback_scope, job.cache_write_allowed);
+    const assignment = await this.cacheAssignment(runnerName, repository);
+    return assignment?.jobId === jobId ? assignment.cacheScope : undefined;
   }
 
-  /**
-   * A JIT configuration is not pinned to the queued job that caused its
-   * creation. GitHub may give it any older compatible job in the repository.
-   * Its `in_progress` delivery is therefore the authoritative runner-to-job
-   * assignment. Move the active Container reservation to that actual job and
-   * put the displaced job back through normal admission with a fresh JIT name.
-   */
   async workflowJobStarted(input: SchedulerRunnerClaimInput): Promise<SchedulerResult> {
-    this.recordJitRunnerAssignment(input);
-    const runnerOwner = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE runner_name = ? AND status IN ('provisioning', 'running', 'releasing')`,
-      input.runnerName,
-    )[0];
-    if (runnerOwner === undefined) {
-      return { accepted: false, admissions: [] };
-    }
-
-    const actualJob = this.job(input.jobId);
-    if (
-      !jobMatchesRunnerClaim(runnerOwner, input) ||
-      actualJob === undefined ||
-      !jobMatchesRunnerClaim(actualJob, input)
-    ) {
-      this.recordEvent("github-job-started-with-unmatched-runner", {
-        jobId: input.jobId,
-        slotId: runnerOwner.slot_id ?? undefined,
-        detail: {
-          runnerName: input.runnerName,
-          runnerOwnerJobId: runnerOwner.job_id,
-          profileKey: input.profile.key,
-        },
-      });
-      return { accepted: false, admissions: [] };
-    }
-
-    if (runnerOwner.job_id === input.jobId) {
-      this.ctx.storage.sql.exec(
-        "UPDATE scheduler_jobs SET github_assignment_observed = 1, updated_at = ? WHERE job_id = ?",
-        now(),
-        input.jobId,
-      );
-      this.recordEvent("github-job-started", {
-        jobId: input.jobId,
-        slotId: runnerOwner.slot_id ?? undefined,
-        detail: { runnerName: input.runnerName, runnerId: input.runnerId ?? runnerOwner.runner_id },
-      });
-      return { accepted: true, admissions: [] };
-    }
-
-    if (runnerOwner.slot_id === null || actualJob.profile_key !== input.profile.key) {
-      this.recordEvent("github-job-started-with-unmatched-runner", {
-        jobId: input.jobId,
-        slotId: runnerOwner.slot_id ?? undefined,
-        detail: {
-          runnerName: input.runnerName,
-          runnerOwnerJobId: runnerOwner.job_id,
-          profileKey: input.profile.key,
-        },
-      });
-      return { accepted: false, admissions: [] };
-    }
-
-    const timestamp = now();
-    const { retryAttempt, retryRunnerName } = this.requeueWithFreshRunner(
-      runnerOwner,
-      `JIT runner ${input.runnerName} was assigned to GitHub job ${input.jobId}; retrying with a fresh runner`,
-    );
-    this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET status = 'running', runner_name = ?, slot_id = ?, runner_id = ?, failure_reason = NULL,
-           container_stopped_at = NULL, container_exit_code = NULL, container_stop_reason = NULL,
-           recovery_due_at = NULL, runner_cleanup_state = 'none', runner_cleanup_due_at = NULL,
-           github_assignment_observed = 1, updated_at = ?
-       WHERE job_id = ?`,
-      input.runnerName,
-      runnerOwner.slot_id,
-      input.runnerId ?? runnerOwner.runner_id,
-      timestamp,
-      actualJob.job_id,
-    );
-    this.recordEvent("jit-runner-reassigned", {
-      jobId: actualJob.job_id,
-      slotId: runnerOwner.slot_id,
-      detail: {
-        runnerName: input.runnerName,
-        runnerId: input.runnerId ?? runnerOwner.runner_id,
-        fromJobId: runnerOwner.job_id,
-      },
-    });
-    this.recordEvent("github-job-requeued-after-jit-mismatch", {
-      jobId: runnerOwner.job_id,
-      detail: { runnerName: retryRunnerName, assignedJobId: actualJob.job_id, retryAttempt },
-    });
-
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
-    return { accepted: true, admissions };
-  }
-
-  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): void {
-    const runner = this.rows<JitRunnerRow>(
-      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
-      input.runnerName,
-    )[0];
-    const assignedJob = this.job(input.jobId);
+    const runner = this.runner(input.runnerName);
+    const job = this.job(input.jobId);
     if (
       runner === undefined ||
-      assignedJob === undefined ||
-      runner.github_owner.toLowerCase() !== input.target.owner.toLowerCase() ||
-      runner.github_repository.toLowerCase() !== input.target.repository.toLowerCase() ||
-      runner.profile_key !== input.profile.key ||
-      !jobMatchesRunnerClaim(assignedJob, input)
+      runner.reserved === 0 ||
+      runner.container_stopped_at !== null ||
+      job === undefined ||
+      !matchesRunner(runner, input.target, input.profile.key) ||
+      !matchesRunner(job, input.target, input.profile.key)
     ) {
-      return;
+      return { accepted: false, admissions: [] };
     }
     this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jit_runners
-       SET assigned_job_id = ?, assignment_observed = 1, updated_at = ?
+      `UPDATE scheduler_jit_runners SET assigned_job_id = ?, assignment_observed = 1, updated_at = ?
        WHERE runner_name = ?`,
       input.jobId,
-      now(),
+      Date.now(),
       input.runnerName,
     );
-  }
-
-  /** Send a job back through admission under a fresh JIT runner name; the caller owns its old reservation. */
-  private requeueWithFreshRunner(job: JobRow, reason: string) {
-    const retryAttempt = job.runner_attempt + 1;
-    const retryRunnerName = `${job.runner_name.replace(/-r\d+$/u, "")}-r${retryAttempt}`;
     this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET status = 'queued', runner_name = ?, runner_attempt = ?, slot_id = NULL, runner_id = NULL,
-           failure_reason = ?, container_stopped_at = NULL, container_exit_code = NULL,
-           container_stop_reason = NULL, recovery_due_at = NULL, runner_cleanup_state = 'none',
-           runner_cleanup_due_at = NULL, github_assignment_observed = 0, updated_at = ?
-       WHERE job_id = ?`,
-      retryRunnerName,
-      retryAttempt,
-      reason,
-      now(),
-      job.job_id,
+      `UPDATE scheduler_jobs SET status = CASE WHEN status IN ('completed', 'cancelled', 'failed') THEN status ELSE 'running' END,
+         github_assignment_observed = 1, recovery_due_at = NULL,
+         updated_at = ? WHERE job_id = ?`,
+      Date.now(),
+      input.jobId,
     );
-    return { retryAttempt, retryRunnerName };
+    this.recordEvent("github-job-started", {
+      jobId: input.jobId,
+      slotId: runner.slot_id,
+      detail: { runnerName: input.runnerName, runnerId: input.runnerId ?? runner.runner_id },
+    });
+    if (job.status === "admitted" && job.runner_name !== input.runnerName) {
+      await this.cancelPendingRunner(job.runner_name);
+    }
+    await this.scheduleWorkAlarmIfNeeded();
+    return { accepted: true, admissions: [] };
   }
 
-  private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
-    if (job.slot_id === null) {
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET status = ?, updated_at = ?, failure_reason = ?, recovery_due_at = NULL
-         WHERE job_id = ?`,
-        status,
-        now(),
-        reason ?? null,
-        job.job_id,
-      );
+  private releaseRunner(runner: JitRunnerRow): void {
+    if (runner.reserved === 0) {
       return;
     }
-    const slot = this.slot(job.slot_id);
-    if (slot === undefined) {
-      return;
-    }
-    const reservedCount = Math.max(0, slot.reserved_count - 1);
-    const targetMaxInstances = Math.max(slot.applied_max_instances, reservedCount);
-    const timestamp = now();
     this.ctx.storage.sql.exec(
-      `UPDATE scheduler_slots SET reserved_count = ?, desired_max_instances = ?, last_released_at = ?,
-       configuration_state = CASE WHEN ? = 0 AND configuration_state = 'configuring' THEN 'idle' ELSE configuration_state END,
-       configuration_owner_job_id = CASE WHEN ? = 0 AND configuration_state = 'configuring' THEN NULL ELSE configuration_owner_job_id END
+      "UPDATE scheduler_jit_runners SET reserved = 0 WHERE runner_name = ? AND reserved = 1",
+      runner.runner_name,
+    );
+    if (this.rows<{ changes: number }>("SELECT changes() AS changes")[0]?.changes !== 1) {
+      return;
+    }
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_slots SET reserved_count = reserved_count - 1,
+       desired_max_instances = MAX(applied_max_instances, reserved_count - 1), last_released_at = ?,
+       configuration_state = CASE WHEN reserved_count = 1 AND configuration_state = 'configuring' THEN 'idle' ELSE configuration_state END,
+       configuration_owner_job_id = CASE WHEN reserved_count = 1 AND configuration_state = 'configuring' THEN NULL ELSE configuration_owner_job_id END
        WHERE slot_id = ?`,
-      reservedCount,
-      targetMaxInstances,
-      timestamp,
-      reservedCount,
-      reservedCount,
-      slot.slot_id,
+      Date.now(),
+      runner.slot_id,
     );
+    this.recordEvent("scheduler-released", {
+      jobId: runner.source_job_id,
+      slotId: runner.slot_id,
+      detail: { runnerName: runner.runner_name },
+    });
+  }
+
+  private finishJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
     this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET status = ?, updated_at = ?, failure_reason = ?, recovery_due_at = NULL
-       WHERE job_id = ?`,
+      `UPDATE scheduler_jobs SET status = ?, updated_at = ?, failure_reason = ?, recovery_due_at = NULL WHERE job_id = ?`,
       status,
-      timestamp,
+      Date.now(),
       reason ?? null,
       job.job_id,
     );
-    this.recordEvent("scheduler-released", {
-      jobId: job.job_id,
-      slotId: slot.slot_id,
-      detail: { status, reservedCount, retainedMaxInstances: targetMaxInstances },
-    });
   }
 
-  async provisioningFailed(jobId: string, reason: string): Promise<SchedulerResult> {
+  async provisioningFailed(jobId: string, runnerName: string, reason: string): Promise<SchedulerResult> {
     const job = this.job(jobId);
-    if (job === undefined || !activeJobStates.has(job.status)) {
+    if (job === undefined || job.runner_name !== runnerName) {
       return { accepted: false, admissions: [] };
     }
-    this.releaseJob(job, "failed", reason);
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
-    return { accepted: false, admissions };
+    const runner = this.runner(runnerName);
+    if (runner !== undefined && runner.runner_id === null) {
+      await this.cancelPendingRunner(runnerName);
+      const current = this.job(jobId);
+      if (
+        this.runner(runnerName)?.reserved === 0 &&
+        current?.github_assignment_observed === 0 &&
+        current.runner_name === runnerName &&
+        (current.status === "admitted" || current.status === "provisioning")
+      ) {
+        this.finishJob(current, "failed", reason);
+      }
+    } else if (runner !== undefined) {
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jit_runners SET provisioning_deadline = 0 WHERE runner_name = ?",
+        runnerName,
+      );
+    }
+    this.recordEvent("runner-provisioning-failed", { jobId, detail: { runnerName, reason } });
+    return { accepted: false, admissions: await this.admitAndSchedule() };
   }
 
-  async workflowJobCompleted(jobId: string): Promise<SchedulerResult> {
+  async workflowJobCompleted(jobId: string, runnerName?: string): Promise<SchedulerResult> {
     const job = this.job(jobId);
     if (job === undefined) {
       return { accepted: false, admissions: [] };
     }
-    if (job.status === "queued" || job.status === "admitted") {
-      this.releaseJob(job, "cancelled", "GitHub completed before the runner started");
-      this.recordEvent("github-job-completed-before-start", { jobId, slotId: job.slot_id ?? undefined });
-      const admissions = this.admitNext();
-      await this.scheduleWorkAlarmIfNeeded();
-      return { accepted: true, admissions };
+    if (runnerName !== undefined) {
+      const assigned = this.runner(runnerName);
+      if (
+        assigned !== undefined &&
+        matchesRunner(assigned, { owner: job.github_owner, repository: job.github_repository }, job.profile_key) &&
+        (assigned.assigned_job_id === null || assigned.assigned_job_id === jobId)
+      ) {
+        this.ctx.storage.sql.exec(
+          "UPDATE scheduler_jit_runners SET assigned_job_id = ?, assignment_observed = 1 WHERE runner_name = ?",
+          jobId,
+          runnerName,
+        );
+      }
     }
-    if (job.status === "stopped-awaiting-completion") {
-      this.releaseJob(job, "completed");
-      this.recordEvent("github-job-completed-after-container-stop", { jobId, slotId: job.slot_id ?? undefined });
-      const admissions = this.admitNext();
-      await this.scheduleWorkAlarmIfNeeded();
-      return { accepted: true, admissions };
+    const runner = this.runner(job.runner_name);
+    if (job.status === "admitted") {
+      await this.cancelPendingRunner(job.runner_name);
     }
-    if (job.status === "provisioning" || job.status === "running") {
-      const timestamp = now();
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET status = 'releasing', recovery_due_at = ?, updated_at = ?
-         WHERE job_id = ?`,
-        timestamp + RUNNER_COMPLETION_GRACE_MS,
-        timestamp,
-        jobId,
-      );
-      this.recordEvent("github-job-completed", { jobId, slotId: job.slot_id ?? undefined });
-      await this.scheduleWorkAlarmIfNeeded();
+    if (job.status !== "completed") {
+      this.finishJob(job, "completed");
     }
-    return { accepted: true, admissions: [] };
+    this.recordEvent("github-job-completed", { jobId, slotId: runner?.slot_id });
+    return { accepted: true, admissions: await this.admitAndSchedule() };
   }
 
-  async runnerStopped(runnerName: string, stop: { exitCode: number; reason: string }): Promise<SchedulerResult> {
-    const job = this.rows<JobRow>("SELECT * FROM scheduler_jobs WHERE runner_name = ?", runnerName)[0];
-    if (job === undefined || !activeJobStates.has(job.status)) {
-      return { accepted: false, admissions: [] };
+  private async runtimeState(
+    runner: JitRunnerRow,
+    deadline: number,
+  ): Promise<ReturnType<RunnerLifetime["reconcile"]> | "unavailable"> {
+    try {
+      return await runnerContainerFor(this.env, runner.slot_id, runner.runner_name).reconcile(deadline);
+    } catch (error) {
+      const [lastEvent] = this.rows<{ kind: string }>(
+        "SELECT kind FROM scheduler_events WHERE job_id = ? ORDER BY created_at DESC, event_id DESC LIMIT 1",
+        runner.source_job_id,
+      );
+      // One event per outage: a retry every alarm would push the capped history out.
+      if (lastEvent?.kind === "runner-runtime-reconciliation-retry") {
+        return "unavailable";
+      }
+      this.recordEvent("runner-runtime-reconciliation-retry", {
+        jobId: runner.source_job_id,
+        slotId: runner.slot_id,
+        detail: { runnerName: runner.runner_name, error: error instanceof Error ? error.message : String(error) },
+      });
+      return "unavailable";
     }
-    const timestamp = now();
-    this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET container_stopped_at = ?, container_exit_code = ?, container_stop_reason = ?, updated_at = ?
-       WHERE job_id = ?`,
-      timestamp,
-      stop.exitCode,
-      stop.reason,
-      timestamp,
-      job.job_id,
-    );
-    this.recordEvent("container-stopped", {
-      jobId: job.job_id,
-      slotId: job.slot_id ?? undefined,
-      detail: stop,
-    });
-    if (job.status === "releasing") {
-      this.releaseJob(job, "completed");
-      const admissions = this.admitNext();
-      await this.scheduleWorkAlarmIfNeeded();
-      return { accepted: true, admissions };
-    }
-
-    this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
-       SET status = 'stopped-awaiting-completion', recovery_due_at = ?, updated_at = ?
-       WHERE job_id = ?`,
-      timestamp + RUNNER_COMPLETION_GRACE_MS,
-      timestamp,
-      job.job_id,
-    );
-    this.recordEvent("container-stop-awaiting-github-completion", {
-      jobId: job.job_id,
-      slotId: job.slot_id ?? undefined,
-      detail: { recoveryDueAt: timestamp + RUNNER_COMPLETION_GRACE_MS },
-    });
-    // A stopped container can never run its job, so its JIT registration would sit
-    // offline until GitHub's one-day reaper; drop it now. This is the only place
-    // the Worker deregisters a runner: here its Container has provably stopped.
-    await this.retryRunnerCleanup(this.job(job.job_id) ?? job);
-    await this.scheduleWorkAlarmIfNeeded();
-    return { accepted: true, admissions: [] };
   }
 
-  /**
-   * Delete a stopped runner's registration; a runner without a recorded stop is
-   * never deleted. A job may move to another runner during the GitHub calls, so
-   * results are recorded only while the job still names this runner.
-   */
-  private async retryRunnerCleanup(job: JobRow): Promise<void> {
-    const timestamp = now();
-    if (job.runner_id === null || job.container_stopped_at === null) {
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL
-         WHERE job_id = ?`,
-        job.job_id,
-      );
-      this.recordEvent("jit-runner-cleanup-skipped", { jobId: job.job_id, slotId: job.slot_id ?? undefined });
+  private async cancelPendingRunner(runnerName: string): Promise<void> {
+    const runner = this.runner(runnerName);
+    if (runner === undefined || runner.reserved === 0 || runner.runner_id !== null) {
       return;
     }
-
-    try {
-      const target = { owner: job.github_owner, repository: job.github_repository };
-      const token = await githubTokenForRunner(this.env, target, job.github_installation_id, (legacyTarget) =>
-        githubRunnerTokenFor(this.env, legacyTarget),
-      );
-      if (token === undefined) {
-        throw new Error(`No GitHub App installation token is available for ${target.owner}`);
-      }
-      const result = await deleteGitHubRunner({ ...target, token }, job.runner_id);
-      if (result.kind === "deleted" || result.kind === "not-found") {
-        this.ctx.storage.sql.exec(
-          `UPDATE scheduler_jobs
-           SET runner_cleanup_state = 'done', runner_cleanup_due_at = NULL,
-               runner_cleanup_attempts = runner_cleanup_attempts + 1
-           WHERE job_id = ? AND runner_id = ?`,
-          job.job_id,
-          job.runner_id,
-        );
-        this.recordEvent("jit-runner-cleanup-complete", {
-          jobId: job.job_id,
-          slotId: job.slot_id ?? undefined,
-          detail: { runnerId: job.runner_id, result: result.kind },
-        });
-        return;
-      }
-
+    if ((await this.runtimeState(runner, 0)) === "stopped") {
       this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET runner_cleanup_state = 'retry', runner_cleanup_due_at = ?,
-             runner_cleanup_attempts = runner_cleanup_attempts + 1
-         WHERE job_id = ? AND runner_id = ?`,
-        timestamp + RUNNER_CLEANUP_RETRY_MS,
-        job.job_id,
-        job.runner_id,
+        "UPDATE scheduler_jit_runners SET container_stopped_at = ?, container_stop_reason = 'retired-before-start' WHERE runner_name = ?",
+        Date.now(),
+        runnerName,
       );
-      this.recordEvent("jit-runner-cleanup-retry", {
-        jobId: job.job_id,
-        slotId: job.slot_id ?? undefined,
-        detail: { runnerId: job.runner_id, result: result.kind, retryAt: timestamp + RUNNER_CLEANUP_RETRY_MS },
-      });
-    } catch (error) {
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET runner_cleanup_state = 'retry', runner_cleanup_due_at = ?,
-             runner_cleanup_attempts = runner_cleanup_attempts + 1
-         WHERE job_id = ? AND runner_id = ?`,
-        timestamp + RUNNER_CLEANUP_RETRY_MS,
-        job.job_id,
-        job.runner_id,
-      );
-      this.recordEvent("jit-runner-cleanup-retry", {
-        jobId: job.job_id,
-        slotId: job.slot_id ?? undefined,
-        detail: {
-          runnerId: job.runner_id,
-          error: error instanceof Error ? error.message : String(error),
-          retryAt: timestamp + RUNNER_CLEANUP_RETRY_MS,
-        },
-      });
+      this.releaseRunner(runner);
     }
   }
 
-  private async recoverStoppedRunners(): Promise<SchedulerAdmission[]> {
-    const timestamp = now();
-    const stoppedJobs = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE status IN ('stopped-awaiting-completion', 'releasing')
-         AND recovery_due_at IS NOT NULL
-         AND recovery_due_at <= ?
-       ORDER BY recovery_due_at ASC, job_id ASC`,
-      timestamp,
-    );
+  private async reconcileRunnerReservations(): Promise<SchedulerAdmission[]> {
     const admissions: SchedulerAdmission[] = [];
-    for (const candidate of stoppedJobs) {
-      // eslint-disable-next-line no-await-in-loop -- each GitHub read is an account-scoped recovery action.
-      const job = await this.jobStillUnstarted(candidate);
-      if (job === undefined) {
-        admissions.push(...this.admitNext());
-        continue;
+    for (const runner of this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners WHERE reserved = 1")) {
+      // eslint-disable-next-line no-await-in-loop -- release requires a fenced runtime observation of each identity.
+      const state = await this.runtimeState(runner, runner.provisioning_deadline);
+      if (state === "running") {
+        this.ctx.storage.sql.exec(
+          "UPDATE scheduler_jit_runners SET provisioning_deadline = 0 WHERE runner_name = ?",
+          runner.runner_name,
+        );
+      } else if (state === "stopped") {
+        // eslint-disable-next-line no-await-in-loop -- the runtime has fenced off future starts of this identity.
+        const result = await this.runnerStopped(runner.runner_name, { exitCode: null, reason: "runtime-not-running" });
+        admissions.push(...result.admissions);
       }
-      const awaitingContainerStop = job.status === "releasing";
-      this.recordEvent(
-        awaitingContainerStop ? "container-stop-missing-recovery-started" : "container-stop-recovery-started",
-        {
-          jobId: job.job_id,
-          slotId: job.slot_id ?? undefined,
-          detail: { runnerId: job.runner_id, stoppedAt: job.container_stopped_at },
-        },
-      );
-      this.releaseJob(
-        job,
-        awaitingContainerStop ? "completed" : "failed",
-        awaitingContainerStop ? undefined : "Container stopped before GitHub reported the job complete",
-      );
-      admissions.push(...this.admitNext());
-    }
-
-    const cleanupRetries = this.rows<JobRow>(
-      `SELECT * FROM scheduler_jobs
-       WHERE runner_cleanup_state = 'retry'
-         AND runner_cleanup_due_at IS NOT NULL
-         AND runner_cleanup_due_at <= ?
-       ORDER BY runner_cleanup_due_at ASC, job_id ASC`,
-      timestamp,
-    );
-    for (const job of cleanupRetries) {
-      // eslint-disable-next-line no-await-in-loop -- each deletion is an account-scoped recovery action.
-      await this.retryRunnerCleanup(job);
     }
     return admissions;
   }
 
-  /**
-   * Its runner exits two minutes after connecting when no job reached it, for
-   * example while the job waits on a `concurrency` group. If GitHub still has
-   * that job waiting, give it a fresh runner once the stopped runner is
-   * deregistered, and return undefined. Otherwise return the current row for
-   * release, or undefined when it changed meanwhile or must be retried.
-   */
-  private async jobStillUnstarted(candidate: JobRow): Promise<JobRow | undefined> {
-    const unchanged = (): JobRow | undefined => {
-      const current = this.job(candidate.job_id);
-      return current?.status === candidate.status && current.runner_name === candidate.runner_name
-        ? current
-        : undefined;
-    };
-    const retryLater = (retryAt: number, reason: string): undefined => {
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs SET recovery_due_at = ?
-         WHERE job_id = ? AND status = 'stopped-awaiting-completion' AND runner_name = ?`,
-        retryAt,
-        candidate.job_id,
-        candidate.runner_name,
-      );
-      this.recordEvent("container-stop-recovery-retry", { jobId: candidate.job_id, detail: { reason, retryAt } });
-      return undefined;
-    };
-    let job = unchanged();
-    if (job?.status !== "stopped-awaiting-completion") {
-      return job;
+  async runnerStopped(runnerName: string, stop: { exitCode: number | null; reason: string }): Promise<SchedulerResult> {
+    const runner = this.runner(runnerName);
+    if (runner === undefined || runner.container_stopped_at !== null) {
+      return { accepted: false, admissions: [] };
     }
-    // A Worker deployment can interrupt runnerStopped before its deregistration.
-    if (job.runner_cleanup_state === "none") {
-      await this.retryRunnerCleanup(job);
-      job = unchanged();
+    const timestamp = Date.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_jit_runners SET container_stopped_at = ?, container_exit_code = ?,
+         container_stop_reason = ?, updated_at = ? WHERE runner_name = ?`,
+      timestamp,
+      stop.exitCode,
+      stop.reason,
+      timestamp,
+      runnerName,
+    );
+    this.releaseRunner(runner);
+    this.recordEvent("container-stopped", {
+      jobId: runner.assigned_job_id ?? runner.source_job_id,
+      slotId: runner.slot_id,
+      detail: { ...stop, runnerName },
+    });
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_jobs SET status = 'stopped-awaiting-completion', recovery_due_at = ?, updated_at = ?
+       WHERE (job_id = ? AND runner_name = ? AND github_assignment_observed = 0
+         AND status IN ('admitted', 'provisioning', 'running'))
+         OR (job_id = ? AND status = 'running')`,
+      timestamp + RUNNER_COMPLETION_GRACE_MS,
+      timestamp,
+      runner.source_job_id,
+      runnerName,
+      runner.assigned_job_id,
+    );
+    const admissions = await this.admitAndSchedule();
+    const stopped = this.rows<StoppedJitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ? AND container_stopped_at IS NOT NULL",
+      runnerName,
+    )[0];
+    if (stopped !== undefined) {
+      await this.retryRunnerCleanup(stopped);
     }
-    if (job === undefined || job.github_assignment_observed !== 0) {
-      return job;
+    await this.scheduleWorkAlarmIfNeeded();
+    return { accepted: true, admissions };
+  }
+
+  private async retryRunnerCleanup(runner: StoppedJitRunnerRow): Promise<void> {
+    let retryReason: string | undefined;
+    try {
+      if (runner.runner_id !== null) {
+        const target = { owner: runner.github_owner, repository: runner.github_repository };
+        const token = await githubTokenForRunner(this.env, target, runner.github_installation_id, (legacyTarget) =>
+          githubRunnerTokenFor(this.env, legacyTarget),
+        );
+        if (token === undefined) {
+          throw new Error(`No GitHub App installation token is available for ${target.owner}`);
+        }
+        const result = await deleteGitHubRunner({ ...target, token }, runner.runner_id);
+        if (result.kind !== "deleted" && result.kind !== "not-found") {
+          retryReason = result.kind;
+        }
+      }
+    } catch (error) {
+      retryReason = error instanceof Error ? error.message : String(error);
     }
+    const retryAt = retryReason === undefined ? null : Date.now() + RUNNER_CLEANUP_RETRY_MS;
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_jit_runners SET runner_cleanup_state = ?, runner_cleanup_due_at = ?,
+         runner_cleanup_attempts = runner_cleanup_attempts + 1 WHERE runner_name = ? AND runner_id IS ?`,
+      retryReason === undefined ? "done" : "retry",
+      retryAt,
+      runner.runner_name,
+      runner.runner_id,
+    );
+    this.recordEvent(retryReason === undefined ? "jit-runner-cleanup-complete" : "jit-runner-cleanup-retry", {
+      jobId: runner.source_job_id,
+      slotId: runner.slot_id,
+      detail: { runnerName: runner.runner_name, runnerId: runner.runner_id, error: retryReason, retryAt },
+    });
+  }
+
+  private async recoverStoppedRunners(): Promise<SchedulerAdmission[]> {
+    const timestamp = Date.now();
+    const cleanups = this.rows<StoppedJitRunnerRow>(
+      `SELECT * FROM scheduler_jit_runners WHERE container_stopped_at IS NOT NULL
+       AND (runner_cleanup_state = 'none' OR (runner_cleanup_state = 'retry' AND runner_cleanup_due_at <= ?))`,
+      timestamp,
+    );
+    for (const runner of cleanups) {
+      // eslint-disable-next-line no-await-in-loop -- each deletion is an account-scoped recovery action.
+      await this.retryRunnerCleanup(runner);
+    }
+    const stoppedJobs = this.rows<JobRow>(
+      `SELECT * FROM scheduler_jobs WHERE status = 'stopped-awaiting-completion' AND recovery_due_at <= ?
+       ORDER BY recovery_due_at, job_id`,
+      timestamp,
+    );
+    for (const candidate of stoppedJobs) {
+      // eslint-disable-next-line no-await-in-loop -- each GitHub read is an account-scoped recovery action.
+      await this.recoverDemand(candidate);
+    }
+    return this.admitNext();
+  }
+
+  private async recoverDemand(candidate: JobRow): Promise<void> {
     let status: string;
     try {
-      const target = { owner: job.github_owner, repository: job.github_repository };
-      const token = await githubTokenForRunner(this.env, target, job.github_installation_id, (legacyTarget) =>
+      const target = { owner: candidate.github_owner, repository: candidate.github_repository };
+      const token = await githubTokenForRunner(this.env, target, candidate.github_installation_id, (legacyTarget) =>
         githubRunnerTokenFor(this.env, legacyTarget),
       );
       if (token === undefined) {
         throw new Error(`No GitHub App installation token is available for ${target.owner}`);
       }
-      status = await githubJobStatus({ ...target, token }, job.job_id);
+      status = await githubJobStatus({ ...target, token }, candidate.job_id);
     } catch (error) {
-      return retryLater(now() + RUNNER_COMPLETION_GRACE_MS, error instanceof Error ? error.message : String(error));
-    }
-    const current = unchanged();
-    if (current === undefined || status === "in_progress" || status === "completed") {
-      return current;
-    }
-    if (current.runner_cleanup_state === "retry") {
-      // Requeueing forgets the stopped runner's ID, so deregister it first.
-      return retryLater(
-        Math.max(now(), current.runner_cleanup_due_at ?? 0) + RUNNER_COMPLETION_GRACE_MS,
-        "waiting for runner cleanup",
+      this.ctx.storage.sql.exec(
+        `UPDATE scheduler_jobs SET recovery_due_at = ? WHERE job_id = ? AND status = 'stopped-awaiting-completion' AND runner_name = ?`,
+        Date.now() + RUNNER_COMPLETION_GRACE_MS,
+        candidate.job_id,
+        candidate.runner_name,
       );
+      this.recordEvent("container-stop-recovery-retry", {
+        jobId: candidate.job_id,
+        detail: { error: error instanceof Error ? error.message : String(error) },
+      });
+      return;
     }
-    const reason = `JIT runner ${current.runner_name} exited before GitHub gave it job ${current.job_id}; retrying with a fresh runner`;
-    this.releaseJob(current, "failed", reason);
-    const { retryRunnerName, retryAttempt } = this.requeueWithFreshRunner(current, reason);
-    this.recordEvent("github-job-requeued-after-idle-runner", {
-      jobId: current.job_id,
-      detail: { runnerName: retryRunnerName, githubStatus: status, retryAttempt },
-    });
-    return undefined;
-  }
-
-  /**
-   * A Worker deployment can interrupt a Container's onStop callback after
-   * GitHub has completed the job. Persist a deadline so that the account-level
-   * reservation cannot be stranded if that callback never reaches this DO.
-   */
-  private scheduleReleaseRecoveries(): void {
+    const job = this.job(candidate.job_id);
+    if (job?.status !== "stopped-awaiting-completion" || job.runner_name !== candidate.runner_name) {
+      return;
+    }
+    if (status === "in_progress" || status === "completed") {
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = ?, recovery_due_at = NULL WHERE job_id = ?",
+        status === "in_progress" ? "running" : "completed",
+        job.job_id,
+      );
+      return;
+    }
+    const reason = "Container exited while GitHub job was still waiting";
+    const retryAttempt = job.runner_attempt + 1;
+    const retryRunnerName = `${job.runner_name.replace(/-r\d+$/u, "")}-r${retryAttempt}`;
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs
-       SET recovery_due_at = ?
-       WHERE status = 'releasing' AND recovery_due_at IS NULL`,
-      now() + RUNNER_COMPLETION_GRACE_MS,
+       SET status = 'queued', runner_name = ?, runner_attempt = ?, slot_id = NULL,
+           failure_reason = ?, recovery_due_at = NULL, github_assignment_observed = 0, updated_at = ?
+       WHERE job_id = ?`,
+      retryRunnerName,
+      retryAttempt,
+      reason,
+      Date.now(),
+      job.job_id,
     );
+
+    this.recordEvent("github-job-requeued-after-idle-runner", {
+      jobId: job.job_id,
+      detail: { runnerName: retryRunnerName, githubStatus: status, retryAttempt },
+    });
   }
 
-  /**
-   * GitHub's completed event is authoritative: the JIT runner can no longer
-   * receive work. If a Worker deployment interrupted its later onStop callback,
-   * free the scheduler reservation before admitting the first post-deploy job.
-   */
-  private releaseCompletedJobsAwaitingContainerStop(): void {
-    const releasingJobs = this.rows<JobRow>("SELECT * FROM scheduler_jobs WHERE status = 'releasing'");
-    for (const job of releasingJobs) {
-      this.releaseJob(job, "completed");
-      this.recordEvent("container-stop-missing-recovered", {
-        jobId: job.job_id,
-        slotId: job.slot_id ?? undefined,
-        detail: { runnerId: job.runner_id, stoppedAt: job.container_stopped_at },
-      });
-    }
-  }
-
-  /** Rebuild the denormalized slot count from durable job state after a restart. */
   private reconcileSlotReservations(): void {
     const slots = this.rows<SlotRow>("SELECT * FROM scheduler_slots");
     for (const slot of slots) {
-      const activeCount =
+      const reservedCount =
         this.rows<{ count: number }>(
           `SELECT COUNT(*) AS count
-         FROM scheduler_jobs
-         WHERE slot_id = ? AND status IN (${activeStatusList()})`,
+         FROM scheduler_jit_runners
+         WHERE slot_id = ? AND reserved = 1`,
           slot.slot_id,
-          ...ACTIVE_JOB_STATES,
         )[0]?.count ?? 0;
-      if (activeCount === slot.reserved_count) {
+      if (reservedCount === slot.reserved_count) {
         continue;
       }
       this.ctx.storage.sql.exec(
-        "UPDATE scheduler_slots SET reserved_count = ? WHERE slot_id = ?",
-        activeCount,
+        "UPDATE scheduler_slots SET reserved_count = ?, desired_max_instances = MAX(desired_max_instances, ?) WHERE slot_id = ?",
+        reservedCount,
+        reservedCount,
         slot.slot_id,
       );
       this.recordEvent("reservation-count-reconciled", {
         slotId: slot.slot_id,
-        detail: { from: slot.reserved_count, to: activeCount },
+        detail: { from: slot.reserved_count, to: reservedCount },
       });
     }
   }
@@ -1833,7 +1650,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          AND pending_memory_mib IS NOT NULL
          AND pending_disk_mb IS NOT NULL`,
     );
-    const timestamp = now();
+    const timestamp = Date.now();
     for (const slot of configuringSlots) {
       const plan = planConfiguredCapacity(
         this.configuredCapacitySlots(),
@@ -1867,7 +1684,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private recoverStalledCapacityUpdates(): void {
-    const timestamp = now();
+    const timestamp = Date.now();
     const inProgressSlots = this.rows<SlotRow>("SELECT * FROM scheduler_slots WHERE capacity_update_in_progress != 0");
     for (const slot of inProgressSlots) {
       const operation = this.rows<{ target_max_instances: number; updated_at: number }>(
@@ -1901,9 +1718,22 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
   }
 
+  private deferCapacityUpdate(slotId: string, generation: number): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_slots
+       SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
+           capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
+       WHERE slot_id = ?`,
+      generation,
+      capacityDebounceDeadline(Date.now()),
+      generation,
+      slotId,
+    );
+  }
+
   private async applyScheduledCapacityUpdates(): Promise<SchedulerAdmission[]> {
     this.recoverStalledCapacityUpdates();
-    const timestamp = now();
+    const timestamp = Date.now();
     const dueSlots = this.rows<SlotRow>(
       `SELECT * FROM scheduler_slots
        WHERE configuration_state = 'ready'
@@ -1942,16 +1772,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           ? reconcileRunnerApplicationCapacity(this.env, slot.application_name, targetMaxInstances)
           : prepareRunnerApplication(this.env, slot.application_name, undefined, targetMaxInstances));
         if ("kind" in prepared && prepared.kind === "rollout") {
-          this.ctx.storage.sql.exec(
-            `UPDATE scheduler_slots
-             SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
-                 capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
-             WHERE slot_id = ?`,
-            generation,
-            capacityDebounceDeadline(now()),
-            generation,
-            slot.slot_id,
-          );
+          this.deferCapacityUpdate(slot.slot_id, generation);
           this.recordEvent("capacity-upscale-rollout-pending", { slotId: slot.slot_id, detail: { generation } });
           continue;
         }
@@ -1967,16 +1788,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           targetMaxInstances,
           error: error instanceof Error ? error.message : String(error),
         });
-        this.ctx.storage.sql.exec(
-          `UPDATE scheduler_slots
-           SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
-               capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
-           WHERE slot_id = ?`,
-          generation,
-          capacityDebounceDeadline(now()),
-          generation,
-          slot.slot_id,
-        );
+        this.deferCapacityUpdate(slot.slot_id, generation);
       }
     }
 
@@ -1986,10 +1798,18 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   async alarm(): Promise<void> {
+    const runtimeAdmissions = await this.reconcileRunnerReservations();
     const recoveredAdmissions = await this.recoverStoppedRunners();
     const capacityAdmissions = await this.applyScheduledCapacityUpdates();
-    const admissions = [...recoveredAdmissions, ...capacityAdmissions, ...this.readyAdmissions(), ...this.admitNext()];
+    const admissions = [
+      ...runtimeAdmissions,
+      ...recoveredAdmissions,
+      ...capacityAdmissions,
+      ...this.readyAdmissions(),
+      ...this.admitNext(),
+    ];
     await this.scheduleWorkAlarmIfNeeded();
+    this.pruneEvents();
     const uniqueAdmissions = new Map(admissions.map((admission) => [admission.jobId, admission]));
     for (const admission of uniqueAdmissions.values()) {
       try {
@@ -2005,9 +1825,13 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
   }
 
-  async status(): Promise<SchedulerStatus> {
+  async status(since?: number): Promise<SchedulerStatus> {
+    this.pruneEvents();
     const reserved = this.reservedResources();
-    const configured = this.configuredResources();
+    const configured = configuredCapacity(this.configuredCapacitySlots());
+    const runnerByName = new Map(
+      this.rows<JitRunnerRow>("SELECT * FROM scheduler_jit_runners").map((runner) => [runner.runner_name, runner]),
+    );
     const jobs = this.rows<JobRow>("SELECT * FROM scheduler_jobs ORDER BY created_at DESC LIMIT 100").map((job) => ({
       jobId: job.job_id,
       runnerName: job.runner_name,
@@ -2015,13 +1839,13 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       profileKey: job.profile_key,
       status: job.status,
       slotId: job.slot_id,
-      queueWaitMs: job.status === "queued" ? Math.max(0, now() - job.created_at) : null,
-      runnerId: job.runner_id,
-      containerStoppedAt: job.container_stopped_at,
-      containerExitCode: job.container_exit_code,
-      containerStopReason: job.container_stop_reason,
+      queueWaitMs: job.status === "queued" ? Math.max(0, Date.now() - job.created_at) : null,
+      runnerId: runnerByName.get(job.runner_name)?.runner_id ?? null,
+      containerStoppedAt: runnerByName.get(job.runner_name)?.container_stopped_at ?? null,
+      containerExitCode: runnerByName.get(job.runner_name)?.container_exit_code ?? null,
+      containerStopReason: runnerByName.get(job.runner_name)?.container_stop_reason ?? null,
       recoveryDueAt: job.recovery_due_at,
-      runnerCleanupState: job.runner_cleanup_state,
+      runnerCleanupState: runnerByName.get(job.runner_name)?.runner_cleanup_state ?? "none",
     }));
     const slots = this.rows<SlotRow>("SELECT * FROM scheduler_slots ORDER BY slot_id ASC").map((slot) => ({
       slotId: slot.slot_id,
@@ -2039,7 +1863,10 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       lastReleasedAt: slot.last_released_at === 0 ? null : slot.last_released_at,
     }));
     const events = this.rows<SchedulerEventRow>(
-      "SELECT * FROM scheduler_events ORDER BY created_at DESC, event_id DESC LIMIT 100",
+      since === undefined
+        ? "SELECT * FROM scheduler_events ORDER BY created_at DESC, event_id DESC LIMIT 100"
+        : `SELECT * FROM scheduler_events WHERE created_at >= ? ORDER BY created_at DESC, event_id DESC LIMIT ${SCHEDULER_EVENT_LIMIT}`,
+      ...(since === undefined ? [] : [since]),
     ).map((event) => ({
       eventId: event.event_id,
       jobId: event.job_id,

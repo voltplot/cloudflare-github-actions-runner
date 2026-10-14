@@ -1,45 +1,29 @@
 import { getContainer } from "@cloudflare/containers";
 
 import type { WorkerEnvironment } from "./environment";
-import type { RunnerContainer } from "./provision";
 
-export function runnerContainerFor(env: WorkerEnvironment, slotId: string, runnerName: string): RunnerContainer {
-  switch (slotId) {
-    case "validation":
-      return getContainer(env.RUNNER_VALIDATION, runnerName);
-    case "preset:lite":
-      return getContainer(env.RUNNER_LITE, runnerName);
-    case "preset:basic":
-      return getContainer(env.RUNNER_BASIC, runnerName);
-    case "preset:standard-1":
-      return getContainer(env.RUNNER_STANDARD_1, runnerName);
-    case "preset:standard-2":
-      return getContainer(env.RUNNER_STANDARD_2, runnerName);
-    case "preset:standard-3":
-      return getContainer(env.RUNNER_STANDARD_3, runnerName);
-    case "preset:standard-4":
-      return getContainer(env.RUNNER_STANDARD_4, runnerName);
-    case "custom:1":
-      return getContainer(env.RUNNER_CUSTOM, runnerName);
-    case "custom:2":
-      return getContainer(env.RUNNER_CUSTOM_2, runnerName);
-    case "custom:3":
-      return getContainer(env.RUNNER_CUSTOM_3, runnerName);
-    case "custom:4":
-      return getContainer(env.RUNNER_CUSTOM_4, runnerName);
-    case "custom:5":
-      return getContainer(env.RUNNER_CUSTOM_5, runnerName);
-    case "custom:6":
-      return getContainer(env.RUNNER_CUSTOM_6, runnerName);
-    case "custom:7":
-      return getContainer(env.RUNNER_CUSTOM_7, runnerName);
-    case "custom:8":
-      return getContainer(env.RUNNER_CUSTOM_8, runnerName);
-    case "custom:9":
-      return getContainer(env.RUNNER_CUSTOM_9, runnerName);
-    case "custom:10":
-      return getContainer(env.RUNNER_CUSTOM_10, runnerName);
-    default:
-      throw new Error(`Unknown Cloudflare runner application slot: ${slotId}`);
+export function runnerContainerFor(env: WorkerEnvironment, slotId: string, runnerName: string) {
+  const namespaces = new Map([
+    ["preset:lite", env.RUNNER_LITE],
+    ["preset:basic", env.RUNNER_BASIC],
+    ["preset:standard-1", env.RUNNER_STANDARD_1],
+    ["preset:standard-2", env.RUNNER_STANDARD_2],
+    ["preset:standard-3", env.RUNNER_STANDARD_3],
+    ["preset:standard-4", env.RUNNER_STANDARD_4],
+    ["custom:1", env.RUNNER_CUSTOM],
+    ["custom:2", env.RUNNER_CUSTOM_2],
+    ["custom:3", env.RUNNER_CUSTOM_3],
+    ["custom:4", env.RUNNER_CUSTOM_4],
+    ["custom:5", env.RUNNER_CUSTOM_5],
+    ["custom:6", env.RUNNER_CUSTOM_6],
+    ["custom:7", env.RUNNER_CUSTOM_7],
+    ["custom:8", env.RUNNER_CUSTOM_8],
+    ["custom:9", env.RUNNER_CUSTOM_9],
+    ["custom:10", env.RUNNER_CUSTOM_10],
+  ]);
+  const namespace = namespaces.get(slotId);
+  if (namespace === undefined) {
+    throw new Error(`Unknown Cloudflare runner application slot: ${slotId}`);
   }
+  return getContainer(namespace, runnerName);
 }

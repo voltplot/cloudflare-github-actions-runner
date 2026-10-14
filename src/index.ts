@@ -332,6 +332,19 @@ export default {
       if (trace === undefined) {
         return json({ error: "Invalid resource trace payload" }, 400);
       }
+      // Every upload pays for retention, so deletion keeps pace with writes even when D1 is full.
+      // Cron Triggers never fired for this Worker.
+      ctx.waitUntil(
+        (async () => {
+          try {
+            await deleteExpiredResourceTraces(env);
+          } catch (error) {
+            console.warn("Could not delete expired resource traces", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })(),
+      );
       try {
         await persistResourceTraceSamples(env, claim, trace.samples);
       } catch (error) {
@@ -639,18 +652,6 @@ export default {
 
       const result = await scheduler.workflowJobCompleted(decision.jobId);
       ctx.waitUntil(startRunnerProvisioningWorkflows(env, result.admissions));
-      // Retention rides on job completions because Cron Triggers never fired for this Worker.
-      ctx.waitUntil(
-        (async () => {
-          try {
-            await deleteExpiredResourceTraces(env);
-          } catch (error) {
-            console.warn("Could not delete expired resource traces", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        })(),
-      );
       console.log("Cloudflare runner job completed", { jobId: decision.jobId });
       return json({ accepted: result.accepted }, 202);
     } catch (error) {

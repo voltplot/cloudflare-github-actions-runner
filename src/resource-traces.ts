@@ -7,8 +7,9 @@ const maxSamplesPerRequest = 15;
 // Longer than GitHub's 5-day self-hosted job limit, so no live runner loses its assignment.
 // https://docs.github.com/en/actions/reference/limits#existing-system-limits
 const resourceTraceRetentionMs = 7 * 24 * 60 * 60 * 1_000;
-// D1 bounds the work of one query: https://developers.cloudflare.com/d1/platform/limits/
-const retentionDeleteBatchRows = 10_000;
+// Far above the samples one upload adds, and small enough for D1's per-query limits:
+// https://developers.cloudflare.com/d1/platform/limits/
+const retentionDeleteBatchRows = 1_000;
 
 export interface ResourceTraceEnvironment {
   RESOURCE_METRICS: D1Database;
@@ -247,10 +248,7 @@ export async function persistResourceTraceSamples(
   );
 }
 
-/**
- * Deletes one bounded batch of trace rows older than the retention window from each table.
- * One batch outpaces what a job writes: a container posts one sample a second.
- */
+/** Deletes one bounded batch of trace rows older than the retention window from each table. */
 export async function deleteExpiredResourceTraces(
   env: Pick<ResourceTraceEnvironment, "RESOURCE_METRICS">,
   now = Date.now(),

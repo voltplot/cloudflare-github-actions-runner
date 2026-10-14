@@ -3,11 +3,12 @@ import { expect, inject, it } from "vite-plus/test";
 
 import type { WorkerEnvironment } from "../../src/environment";
 import worker from "../../src/index";
-import { signedWorkflowJobRequest, webhookSecret } from "./signed-webhook";
+import { createResourceTraceAuthorization } from "../../src/resource-traces";
 
 const day = 24 * 60 * 60 * 1_000;
+const signingKey = "public-test-fixture";
 
-it("a completed job deletes trace rows older than seven days and keeps newer ones", async () => {
+it("a trace upload deletes trace rows older than seven days and keeps newer ones", async () => {
   const database = env.RESOURCE_METRICS;
   await applyD1Migrations(database, inject("resourceMetricsMigrations"));
   const now = Date.now();
@@ -28,32 +29,43 @@ it("a completed job deletes trace rows older than seven days and keeps newer one
         .bind(runnerName, at),
     ]),
   );
+  const authorization = await createResourceTraceAuthorization(signingKey, {
+    runnerName: "cf-standard-3-job-3",
+    jobId: "3",
+    repository: "biw/example",
+  });
+  const sample = {
+    timestamp: "2026-01-01T00:00:00Z",
+    elapsedSeconds: 0,
+    intervalSeconds: 1,
+    phase: "Run tests",
+    cpuTotalUsec: 0,
+    cpuDeltaUsec: 0,
+    cpuCoresAvg: 0,
+    memoryCurrentBytes: 0,
+    memoryPeakBytes: 0,
+    rootDiskUsedBytes: 0,
+    rootDiskDeltaBytes: 0,
+  };
 
   const ctx = createExecutionContext();
   const response = await worker.fetch(
-    await signedWorkflowJobRequest(
-      JSON.stringify({
-        action: "completed",
-        installation: { id: 42 },
-        repository: { full_name: "biw/runner-poc" },
-        workflow_job: { id: 900, labels: ["cloudflare-standard-3"], runner_name: "cf-standard-3-job-900" },
-      }),
-    ),
-    // SAFETY: a job-completed webhook reads only the bindings set here and the test pool's
-    // scheduler, provisioning workflow and metrics database; no GitHub App secret is reached.
-    {
-      ...(env as WorkerEnvironment),
-      CLOUDFLARE_ACCOUNT_ID: "trace-retention",
-      GITHUB_RUNNER_OWNER: "biw",
-      GITHUB_APP_WEBHOOK_SECRET: webhookSecret,
-    },
+    new Request("https://runner.example.workers.dev/v1/resource-traces", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${authorization}` },
+      body: JSON.stringify({ samples: [sample] }),
+    }),
+    // SAFETY: a trace upload reads only the signing key set here and the metrics database.
+    { ...(env as WorkerEnvironment), RESOURCE_TRACE_SIGNING_KEY: signingKey },
     ctx,
   );
   await waitOnExecutionContext(ctx);
 
   expect(response.status).toBe(202);
   const remaining = async (table: string) =>
-    (await database.prepare(`SELECT runner_name FROM ${table}`).all<{ runner_name: string }>()).results;
-  await expect(remaining("resource_trace_samples")).resolves.toEqual([{ runner_name: "cf-standard-3-job-2" }]);
-  await expect(remaining("resource_trace_assignments")).resolves.toEqual([{ runner_name: "cf-standard-3-job-2" }]);
+    (
+      await database.prepare(`SELECT runner_name FROM ${table} ORDER BY runner_name`).all<{ runner_name: string }>()
+    ).results.map((row) => row.runner_name);
+  await expect(remaining("resource_trace_samples")).resolves.toEqual(["cf-standard-3-job-2", "cf-standard-3-job-3"]);
+  await expect(remaining("resource_trace_assignments")).resolves.toEqual(["cf-standard-3-job-2"]);
 });

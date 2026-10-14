@@ -23,13 +23,12 @@ export class RunnerLifetime {
     if (this.starting !== undefined) {
       return this.starting;
     }
-    const starting = Promise.resolve().then(operation);
-    this.starting = starting;
-    return starting.finally(() => {
-      if (this.starting === starting) {
+    this.starting = Promise.resolve()
+      .then(operation)
+      .finally(() => {
         this.starting = undefined;
-      }
-    });
+      });
+    return this.starting;
   }
 
   reconcile(provisioningDeadline: number): "starting" | "running" | "pending" | "stopped" {

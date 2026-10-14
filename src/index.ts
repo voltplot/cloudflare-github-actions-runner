@@ -483,14 +483,11 @@ export default {
         return json({ error: "Unauthorized" }, 401);
       }
       const sinceParameter = url.searchParams.get("since");
-      if (sinceParameter !== null) {
-        const since = Number(sinceParameter);
-        if (sinceParameter.trim() === "" || !Number.isFinite(since) || !Number.isInteger(since) || since < 0) {
-          return json({ error: "Invalid since timestamp" }, 400);
-        }
-        return json(await env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID).status(since));
+      const since = sinceParameter === null ? undefined : Number(sinceParameter);
+      if (since !== undefined && (sinceParameter?.trim() === "" || !Number.isInteger(since) || since < 0)) {
+        return json({ error: "Invalid since timestamp" }, 400);
       }
-      return json(await env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID).status());
+      return json(await env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID).status(since));
     }
 
     if (request.method !== "POST" || url.pathname !== "/webhooks/github") {

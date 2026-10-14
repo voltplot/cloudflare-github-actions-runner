@@ -1875,7 +1875,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const events = this.rows<SchedulerEventRow>(
       since === undefined
         ? "SELECT * FROM scheduler_events ORDER BY created_at DESC, event_id DESC LIMIT 100"
-        : "SELECT * FROM scheduler_events WHERE created_at >= ? ORDER BY created_at DESC, event_id DESC LIMIT 1000",
+        : `SELECT * FROM scheduler_events WHERE created_at >= ? ORDER BY created_at DESC, event_id DESC LIMIT ${SCHEDULER_EVENT_LIMIT}`,
       ...(since === undefined ? [] : [since]),
     ).map((event) => ({
       eventId: event.event_id,

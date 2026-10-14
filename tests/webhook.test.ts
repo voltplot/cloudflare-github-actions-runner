@@ -313,7 +313,7 @@ describe("GitHub webhook handling", () => {
         }),
         expectedRepository,
       ),
-    ).toEqual({ kind: "job-completed", jobId: "94035733533" });
+    ).toEqual({ kind: "job-completed", jobId: "94035733533", runnerName: "cf-standard-3-job-94035733533" });
     expect(
       classifyGitHubWebhook(
         "workflow_job",
@@ -350,12 +350,12 @@ describe("GitHub webhook handling", () => {
     ).toEqual({ kind: "ignored" });
   });
 
-  it("captures GitHub's actual JIT runner assignment", () => {
+  it.each(["in_progress", "completed"])("captures GitHub's actual JIT runner assignment on %s", (action) => {
     expect(
       classifyGitHubWebhook(
         "workflow_job",
         workflowJobPayload({
-          action: "in_progress",
+          action,
           workflow_job: {
             id: 42,
             labels: ["self-hosted", "Linux", "X64", "cloudflare-ubuntu-latest"],
@@ -365,14 +365,18 @@ describe("GitHub webhook handling", () => {
         }),
         expectedRepository,
       ),
-    ).toEqual({
-      kind: "job-started",
-      jobId: "42",
-      runnerId: 99,
-      runnerName: "cf-standard-3-job-100",
-      profile: RUNNER_PROFILES["standard-3"],
-      installationId: 123,
-    });
+    ).toEqual(
+      action === "completed"
+        ? { kind: "job-completed", jobId: "42", runnerName: "cf-standard-3-job-100" }
+        : {
+            kind: "job-started",
+            jobId: "42",
+            runnerId: 99,
+            runnerName: "cf-standard-3-job-100",
+            profile: RUNNER_PROFILES["standard-3"],
+            installationId: 123,
+          },
+    );
   });
 
   it("ignores an in-progress job without a runner assignment", () => {

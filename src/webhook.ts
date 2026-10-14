@@ -51,7 +51,7 @@ export type WebhookDecision =
       profile: RunnerProfile;
       installationId?: number;
     }
-  | { kind: "job-completed"; jobId: string };
+  | { kind: "job-completed"; jobId: string; runnerName: string };
 
 const positiveIntegerSchema = z.number().int().positive();
 const optionalPositiveIntegerSchema = positiveIntegerSchema.optional().catch(undefined);
@@ -283,7 +283,7 @@ export function classifyGitHubWebhookIntent(
     return { kind: "ignored" };
   }
   if (payload.action === "completed") {
-    return { kind: "job-completed", jobId: String(jobId) };
+    return { kind: "job-completed", jobId: String(jobId), runnerName: assignedRunnerName };
   }
   return {
     kind: "job-started",

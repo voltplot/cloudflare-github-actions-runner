@@ -466,6 +466,14 @@ export default {
       if (!hasValidSetupAuthorization(request, env)) {
         return json({ error: "Unauthorized" }, 401);
       }
+      const sinceParameter = url.searchParams.get("since");
+      if (sinceParameter !== null) {
+        const since = Number(sinceParameter);
+        if (sinceParameter.trim() === "" || !Number.isFinite(since) || !Number.isInteger(since) || since < 0) {
+          return json({ error: "Invalid since timestamp" }, 400);
+        }
+        return json(await env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID).status(since));
+      }
       return json(await env.RUNNER_SCHEDULER.getByName(env.CLOUDFLARE_ACCOUNT_ID).status());
     }
 
@@ -650,7 +658,7 @@ export default {
         return json({ accepted: result.accepted, queued: result.admissions.length !== 0 }, 202);
       }
 
-      const result = await scheduler.workflowJobCompleted(decision.jobId);
+      const result = await scheduler.workflowJobCompleted(decision.jobId, decision.runnerName);
       ctx.waitUntil(startRunnerProvisioningWorkflows(env, result.admissions));
       console.log("Cloudflare runner job completed", { jobId: decision.jobId });
       return json({ accepted: result.accepted }, 202);

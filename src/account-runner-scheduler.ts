@@ -49,29 +49,14 @@ type JobStatus =
 
 type SlotConfigurationState = "ready" | "configuring" | "idle";
 
-type SchedulerEventDetailScalar = boolean | number | string | null;
-type SchedulerEventDetailValue = SchedulerEventDetailScalar | readonly SchedulerEventDetailScalar[];
-
-interface SchedulerEventDetail {
-  readonly [property: string]: SchedulerEventDetailValue | undefined;
-}
-
-type SchedulerEventData = SchedulerEventDetail | string | null;
-
+const schedulerEventScalarSchema = z.union([z.boolean(), z.number(), z.string(), z.null()]);
 const schedulerEventDetailSchema = z.union([
   z.string(),
   z.null(),
-  z.record(
-    z.string(),
-    z.union([
-      z.boolean(),
-      z.number(),
-      z.string(),
-      z.null(),
-      z.array(z.union([z.boolean(), z.number(), z.string(), z.null()])),
-    ]),
-  ),
+  z.record(z.string(), z.union([schedulerEventScalarSchema, z.array(schedulerEventScalarSchema)])),
 ]);
+type SchedulerEventData = z.infer<typeof schedulerEventDetailSchema>;
+type SchedulerEventDetail = Partial<Exclude<SchedulerEventData, string | null>>;
 
 interface JobRow {
   [column: string]: ArrayBuffer | number | string | null;

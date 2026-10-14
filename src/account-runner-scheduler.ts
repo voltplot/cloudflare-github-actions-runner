@@ -1013,6 +1013,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
   }
 
+  private async admitAndSchedule(): Promise<SchedulerAdmission[]> {
+    const admissions = this.admitNext();
+    await this.scheduleWorkAlarmIfNeeded();
+    return admissions;
+  }
+
   async submit(job: SchedulerJobInput): Promise<SchedulerResult> {
     const existing = this.job(job.jobId);
     if (existing !== undefined) {
@@ -1064,8 +1070,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       },
     });
 
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
+    const admissions = await this.admitAndSchedule();
     const stored = this.job(job.jobId);
     return { accepted: true, queueReason: stored === undefined ? undefined : this.queueReason(stored), admissions };
   }
@@ -1085,25 +1090,27 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       await this.scheduleWorkAlarmIfNeeded();
       return { kind: "cancelled" };
     }
-    if (job.status === "queued" || job.status === "admitted") {
-      if (job.slot_id === null) {
-        return { kind: "wait" };
-      }
-      const slot = this.slot(job.slot_id);
-      if (slot === undefined) {
-        return { kind: "missing" };
-      }
-      if (slot.configuration_state === "configuring" && slot.configuration_owner_job_id !== jobId) {
-        return { kind: "wait" };
-      }
-      const ownsConfiguration = slot.configuration_state === "configuring" && slot.configuration_owner_job_id === jobId;
-      if (
-        slot.capacity_reclaim_pending !== 0 ||
-        slot.capacity_update_in_progress !== 0 ||
-        (!ownsConfiguration && slot.applied_max_instances < slot.desired_max_instances)
-      ) {
-        return { kind: "wait" };
-      }
+    const pending = job.status === "queued" || job.status === "admitted";
+    if (!pending && job.status !== "provisioning" && job.status !== "running") {
+      return { kind: "cancelled" };
+    }
+    if (job.slot_id === null) {
+      return { kind: pending ? "wait" : "missing" };
+    }
+    const slot = this.slot(job.slot_id);
+    if (slot === undefined) {
+      return { kind: "missing" };
+    }
+    const configuring = pending && slot.configuration_state === "configuring";
+    if (
+      (configuring && slot.configuration_owner_job_id !== jobId) ||
+      slot.capacity_reclaim_pending !== 0 ||
+      slot.capacity_update_in_progress !== 0 ||
+      (!configuring && slot.applied_max_instances < slot.desired_max_instances)
+    ) {
+      return { kind: "wait" };
+    }
+    if (pending) {
       this.ctx.storage.sql.exec(
         "UPDATE scheduler_jobs SET status = 'provisioning', updated_at = ? WHERE job_id = ?",
         Date.now(),
@@ -1114,26 +1121,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         Date.now() + RUNNER_PROVISIONING_TIMEOUT_MS,
         job.runner_name,
       );
-      return this.provisioningPlan(job, slot);
     }
-    if (job.status === "provisioning" || job.status === "running") {
-      if (job.slot_id === null) {
-        return { kind: "missing" };
-      }
-      const slot = this.slot(job.slot_id);
-      if (slot === undefined) {
-        return { kind: "missing" };
-      }
-      if (
-        slot.capacity_reclaim_pending !== 0 ||
-        slot.capacity_update_in_progress !== 0 ||
-        slot.applied_max_instances < slot.desired_max_instances
-      ) {
-        return { kind: "wait" };
-      }
-      return this.provisioningPlan(job, slot);
-    }
-    return { kind: "cancelled" };
+    return this.provisioningPlan(job, slot);
   }
 
   private provisioningPlan(job: JobRow, slot: SlotRow): RunnerProvisioningPlan {
@@ -1401,9 +1390,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       );
     }
     this.recordEvent("runner-provisioning-failed", { jobId, detail: { runnerName, reason } });
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
-    return { accepted: false, admissions };
+    return { accepted: false, admissions: await this.admitAndSchedule() };
   }
 
   async workflowJobCompleted(jobId: string, runnerName?: string): Promise<SchedulerResult> {
@@ -1433,9 +1420,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       this.finishJob(job, "completed");
     }
     this.recordEvent("github-job-completed", { jobId, slotId: runner?.slot_id });
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
-    return { accepted: true, admissions };
+    return { accepted: true, admissions: await this.admitAndSchedule() };
   }
 
   private async runtimeState(
@@ -1528,8 +1513,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       runnerName,
       runner.assigned_job_id,
     );
-    const admissions = this.admitNext();
-    await this.scheduleWorkAlarmIfNeeded();
+    const admissions = await this.admitAndSchedule();
     const stopped = this.rows<StoppedJitRunnerRow>(
       "SELECT * FROM scheduler_jit_runners WHERE runner_name = ? AND container_stopped_at IS NOT NULL",
       runnerName,
@@ -1761,6 +1745,19 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
   }
 
+  private deferCapacityUpdate(slotId: string, generation: number): void {
+    this.ctx.storage.sql.exec(
+      `UPDATE scheduler_slots
+       SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
+           capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
+       WHERE slot_id = ?`,
+      generation,
+      capacityDebounceDeadline(Date.now()),
+      generation,
+      slotId,
+    );
+  }
+
   private async applyScheduledCapacityUpdates(): Promise<SchedulerAdmission[]> {
     this.recoverStalledCapacityUpdates();
     const timestamp = Date.now();
@@ -1802,16 +1799,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           ? reconcileRunnerApplicationCapacity(this.env, slot.application_name, targetMaxInstances)
           : prepareRunnerApplication(this.env, slot.application_name, undefined, targetMaxInstances));
         if ("kind" in prepared && prepared.kind === "rollout") {
-          this.ctx.storage.sql.exec(
-            `UPDATE scheduler_slots
-             SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
-                 capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
-             WHERE slot_id = ?`,
-            generation,
-            capacityDebounceDeadline(Date.now()),
-            generation,
-            slot.slot_id,
-          );
+          this.deferCapacityUpdate(slot.slot_id, generation);
           this.recordEvent("capacity-upscale-rollout-pending", { slotId: slot.slot_id, detail: { generation } });
           continue;
         }
@@ -1827,16 +1815,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
           targetMaxInstances,
           error: error instanceof Error ? error.message : String(error),
         });
-        this.ctx.storage.sql.exec(
-          `UPDATE scheduler_slots
-           SET capacity_debounce_until = CASE WHEN capacity_generation = ? THEN ? ELSE capacity_debounce_until END,
-               capacity_update_in_progress = CASE WHEN capacity_update_generation = ? THEN 0 ELSE capacity_update_in_progress END
-           WHERE slot_id = ?`,
-          generation,
-          capacityDebounceDeadline(Date.now()),
-          generation,
-          slot.slot_id,
-        );
+        this.deferCapacityUpdate(slot.slot_id, generation);
       }
     }
 

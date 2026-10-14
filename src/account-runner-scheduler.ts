@@ -447,43 +447,19 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         ON scheduler_jit_runners(assigned_job_id, assignment_observed, updated_at);
     `);
 
-    const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_slots)");
-    if (!columns.some((column) => column.name === "applied_max_instances")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN applied_max_instances INTEGER NOT NULL DEFAULT 1",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_debounce_until")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_debounce_until INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_update_in_progress")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_update_in_progress INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    if (!columns.some((column) => column.name === "capacity_update_generation")) {
-      this.ctx.storage.sql.exec(
-        "ALTER TABLE scheduler_slots ADD COLUMN capacity_update_generation INTEGER NOT NULL DEFAULT 0",
-      );
-    }
-    const slotColumnMigrations = [
+    this.addColumns("scheduler_slots", [
+      ["applied_max_instances", "INTEGER NOT NULL DEFAULT 1"],
+      ["capacity_debounce_until", "INTEGER NOT NULL DEFAULT 0"],
+      ["capacity_update_in_progress", "INTEGER NOT NULL DEFAULT 0"],
+      ["capacity_update_generation", "INTEGER NOT NULL DEFAULT 0"],
       ["pending_profile_key", "TEXT"],
       ["pending_vcpu", "REAL"],
       ["pending_memory_mib", "INTEGER"],
       ["pending_disk_mb", "INTEGER"],
       ["capacity_reclaim_pending", "INTEGER NOT NULL DEFAULT 0"],
       ["last_released_at", "INTEGER NOT NULL DEFAULT 0"],
-    ] as const;
-    for (const [name, definition] of slotColumnMigrations) {
-      if (!columns.some((column) => column.name === name)) {
-        this.ctx.storage.sql.exec(`ALTER TABLE scheduler_slots ADD COLUMN ${name} ${definition}`);
-      }
-    }
-
-    const jobColumns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jobs)");
-    const jobColumnMigrations = [
+    ]);
+    this.addColumns("scheduler_jobs", [
       ["github_owner", "TEXT NOT NULL DEFAULT ''"],
       ["github_repository", "TEXT NOT NULL DEFAULT ''"],
       ["head_sha", "TEXT NOT NULL DEFAULT ''"],
@@ -501,12 +477,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["runner_cleanup_state", "TEXT NOT NULL DEFAULT 'none'"],
       ["runner_cleanup_due_at", "INTEGER"],
       ["runner_cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"],
-    ] as const;
-    for (const [name, definition] of jobColumnMigrations) {
-      if (!jobColumns.some((column) => column.name === name)) {
-        this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jobs ADD COLUMN ${name} ${definition}`);
-      }
-    }
+    ]);
     // Jobs that were queued before the pool became multi-repository belong to
     // the original POC repository and must retain a usable cleanup credential.
     if (this.env.LEGACY_GITHUB_OWNER !== undefined && this.env.LEGACY_GITHUB_REPOSITORY !== undefined) {
@@ -519,6 +490,18 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       );
     }
     this.initializeRunnerReservations();
+  }
+
+  private addColumns(
+    table: "scheduler_slots" | "scheduler_jobs",
+    migrations: readonly (readonly [string, string])[],
+  ): void {
+    const columns = new Set(this.rows<{ name: string }>(`PRAGMA table_info(${table})`).map((column) => column.name));
+    for (const [name, definition] of migrations) {
+      if (!columns.has(name)) {
+        this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      }
+    }
   }
 
   private initializeRunnerReservations(): void {

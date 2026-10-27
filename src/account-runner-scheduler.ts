@@ -472,18 +472,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["runner_cleanup_due_at", "INTEGER"],
       ["runner_cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"],
     ]);
-    // Jobs that were queued before the pool became multi-repository belong to
-    // the original POC repository and must retain a usable cleanup credential.
-    if (this.env.LEGACY_GITHUB_OWNER !== undefined && this.env.LEGACY_GITHUB_REPOSITORY !== undefined) {
-      this.ctx.storage.sql.exec(
-        `UPDATE scheduler_jobs
-         SET github_owner = ?, github_repository = ?
-         WHERE github_owner = '' AND github_repository = ''`,
-        this.env.LEGACY_GITHUB_OWNER,
-        this.env.LEGACY_GITHUB_REPOSITORY,
-      );
-    }
     this.initializeRunnerReservations();
+    // Runner rows are never deleted and Cloudflare bills every row a query reads, so the
+    // per-call reads of live runners go through these indexes instead of the whole history.
+    this.ctx.storage.sql.exec(`
+      CREATE INDEX IF NOT EXISTS scheduler_jit_runners_reserved ON scheduler_jit_runners(slot_id) WHERE reserved = 1;
+      CREATE INDEX IF NOT EXISTS scheduler_jit_runners_cleanup
+        ON scheduler_jit_runners(runner_cleanup_state, runner_cleanup_due_at) WHERE container_stopped_at IS NOT NULL;
+    `);
   }
 
   private addColumns(
@@ -506,6 +502,18 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       .one().version;
     if ((version ?? 0) >= 1) {
       return;
+    }
+    // Earlier releases ran this on every start, so migrated objects hold no such jobs.
+    // Jobs that were queued before the pool became multi-repository belong to
+    // the original POC repository and must retain a usable cleanup credential.
+    if (this.env.LEGACY_GITHUB_OWNER !== undefined && this.env.LEGACY_GITHUB_REPOSITORY !== undefined) {
+      this.ctx.storage.sql.exec(
+        `UPDATE scheduler_jobs
+         SET github_owner = ?, github_repository = ?
+         WHERE github_owner = '' AND github_repository = ''`,
+        this.env.LEGACY_GITHUB_OWNER,
+        this.env.LEGACY_GITHUB_REPOSITORY,
+      );
     }
     const columns = this.rows<{ name: string }>("PRAGMA table_info(scheduler_jit_runners)");
     this.addColumns("scheduler_jit_runners", [
@@ -1543,7 +1551,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const timestamp = Date.now();
     const cleanups = this.rows<StoppedJitRunnerRow>(
       `SELECT * FROM scheduler_jit_runners WHERE container_stopped_at IS NOT NULL
-       AND (runner_cleanup_state = 'none' OR (runner_cleanup_state = 'retry' AND runner_cleanup_due_at <= ?))`,
+       AND runner_cleanup_state IN ('none', 'retry') AND (runner_cleanup_state = 'none' OR runner_cleanup_due_at <= ?)`,
       timestamp,
     );
     for (const runner of cleanups) {

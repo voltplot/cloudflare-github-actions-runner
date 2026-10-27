@@ -315,7 +315,8 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await scheduler.submit(active);
     await scheduler.submit(terminal);
     await scheduler.submit(stopped);
-    await setRuntime(active.runnerName, "running");
+    // Restart arms an immediate alarm; a "running" runtime would let it zero the deadline asserted below.
+    await setRuntime(active.runnerName, "starting");
     await runInDurableObject(scheduler, async (_instance, state) => {
       state.storage.sql.exec("DROP TABLE IF EXISTS scheduler_migrations");
       state.storage.sql.exec(
@@ -347,6 +348,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
       } else {
         // Restore .9's default, inherited by .8 inserts after rollback.
         state.storage.sql.exec(`
+          DROP INDEX scheduler_jit_runners_reserved;
           ALTER TABLE scheduler_jit_runners DROP COLUMN reserved;
           ALTER TABLE scheduler_jit_runners ADD COLUMN reserved INTEGER NOT NULL DEFAULT 1;
         `);
@@ -752,5 +754,49 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const status = await scheduler.status();
     expect(reservedCount(status)).toBe(1);
     expect(status.events.filter((event) => event.kind === "runner-runtime-reconciliation-retry")).toHaveLength(1);
+  });
+});
+
+describe("AccountRunnerScheduler storage reads", () => {
+  it("reads only live rows over a job's lifecycle however long the runner history grows", async () => {
+    const history = 1_000;
+    const scheduler = env.RUNNER_SCHEDULER.getByName("long-history");
+    const queuedJob = job("2300", "cf-standard-3-job-2300", "refs/heads/main");
+    await runInDurableObject(scheduler, (_instance, state) => {
+      state.storage.sql.exec(
+        `WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?)
+         INSERT INTO scheduler_jit_runners (runner_name, source_job_id, github_owner, github_repository, profile_key,
+           created_at, updated_at, slot_id, runner_id, container_stopped_at, runner_cleanup_state)
+         SELECT 'old-' || k, 'old-' || k, 'biw', 'runner-poc', 'standard-3', 1, 1, 'preset:standard-3', k, 1, 'done' FROM n`,
+        history,
+      );
+      state.storage.sql.exec(
+        `INSERT INTO scheduler_jobs (job_id, runner_name, github_owner, github_repository, profile_json, profile_key,
+           vcpu, memory_mib, disk_mb, status, slot_id, created_at, updated_at)
+         SELECT 'old-' || k, 'old-' || k, 'biw', 'runner-poc', '{}', 'standard-3', 2, 8192, 16000, 'completed',
+           'preset:standard-3', 1, 1 FROM (SELECT runner_id AS k FROM scheduler_jit_runners)`,
+      );
+    });
+    await scheduler.submit(queuedJob);
+    await prepareProvisioning(scheduler, queuedJob.jobId);
+
+    await runInDurableObject(scheduler, async (instance, state) => {
+      // Cloudflare bills SQL by rows read: https://developers.cloudflare.com/durable-objects/platform/pricing/#sqlite-storage-backend
+      const cursors: SqlStorageCursor<Record<string, SqlStorageValue>>[] = [];
+      const exec = state.storage.sql.exec.bind(state.storage.sql);
+      Object.defineProperty(state.storage.sql, "exec", {
+        value: (query: string, ...bindings: unknown[]) => {
+          const cursor = exec(query, ...bindings);
+          cursors.push(cursor);
+          return cursor;
+        },
+      });
+      await instance.workflowJobStarted({ jobId: queuedJob.jobId, runnerName: queuedJob.runnerName, target, profile });
+      await instance.workflowJobCompleted(queuedJob.jobId, queuedJob.runnerName);
+      await instance.runnerStopped(queuedJob.runnerName, { exitCode: 0, reason: "exited" });
+      await instance.alarm();
+      await instance.submit(job("2301", "cf-standard-3-job-2301", "refs/heads/main"));
+      expect(cursors.reduce((total, cursor) => total + cursor.rowsRead, 0)).toBeLessThan(history);
+    });
   });
 });

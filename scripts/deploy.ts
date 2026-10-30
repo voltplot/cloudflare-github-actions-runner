@@ -291,13 +291,19 @@ async function runWrangler(args, environment, options) {
   }
 }
 
-async function deployedCommit() {
+async function deployedCommit(repository) {
   const { stdout: changes } = await run("git", ["status", "--porcelain"], {}, { quiet: true });
   if (changes.trim() !== "") {
     throw new Error("Commit local changes before deploying: the runner image builds from the deployed commit");
   }
   const { stdout } = await run("git", ["rev-parse", "HEAD"], {}, { quiet: true });
-  return stdout.trim();
+  const commit = stdout.trim();
+  // The image builder downloads this commit from GitHub: https://docs.github.com/en/rest/commits/commits#get-a-commit
+  const response = await fetch(`https://api.github.com/repos/${repository}/commits/${commit}`, { method: "HEAD" });
+  if (!response.ok) {
+    throw new Error(`Push ${commit} to ${repository} before deploying: the runner image builds from GitHub`);
+  }
+  return commit;
 }
 
 async function buildRunnerImage(workerBaseUrl, environment) {
@@ -868,7 +874,6 @@ async function generatedConfig(
 export async function main(arguments_ = process.argv.slice(2)) {
   const dryRun = arguments_.includes("--dry-run");
   const buildImage = arguments_.includes("--build-image");
-  const sourceCommit = await deployedCommit();
   const accountId = nonEmptyStringSchema.safeParse(process.env.CLOUDFLARE_ACCOUNT_ID);
   if (!accountId.success) {
     throw new Error("CLOUDFLARE_ACCOUNT_ID is required for an account-safe deployment");
@@ -902,6 +907,7 @@ export async function main(arguments_ = process.argv.slice(2)) {
   reportDeploymentPhase("Initializing Cloudflare deployment");
   const configText = await readFile(new URL("../wrangler.jsonc", import.meta.url), "utf8");
   const config = parseJsonc(configText);
+  const sourceCommit = await deployedCommit(config.vars.RUNNER_IMAGE_SOURCE_REPOSITORY);
   console.log("Runner image: Cloudflare-hosted remote builder (no local Docker required)");
   reportDeploymentPhase("Checking managed Cloudflare resources");
   const existingWorkerSettings = await currentWorkerSettings(config, environment);

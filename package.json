@@ -43,7 +43,7 @@
     "lint": "vp lint",
     "lint:fix": "vp lint --fix",
     "test": "vp test",
-    "deploy": "vp exec tsx scripts/deploy.ts",
+    "deploy": "vp exec tsx scripts/deploy.ts --build-image",
     "deploy:dry-run": "vp exec tsx scripts/deploy.ts --dry-run",
     "resource-traces": "vp exec tsx scripts/resource-metrics.ts",
     "cf-typegen": "vp exec wrangler types",

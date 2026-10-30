@@ -14,6 +14,14 @@ import {
   parseRunnerOwnershipManifest,
   serializeRunnerOwnershipManifest,
 } from "./resource-ownership";
+import {
+  deleteWorkerSecret,
+  extractWorkerBaseUrl,
+  generateWebhookSecret,
+  putWorkerSecret,
+  startRemoteRunnerImageBuild,
+  waitForRemoteRunnerImageBuild,
+} from "./setup";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const npxCommand = process.platform === "win32" ? "npx.cmd" : "npx";
@@ -280,6 +288,30 @@ async function runWrangler(args, environment, options) {
       process.stderr.write(error.commandOutput);
     }
     throw error;
+  }
+}
+
+async function deployedCommit() {
+  const { stdout: changes } = await run("git", ["status", "--porcelain"], {}, { quiet: true });
+  if (changes.trim() !== "") {
+    throw new Error("Commit local changes before deploying: the runner image builds from the deployed commit");
+  }
+  const { stdout } = await run("git", ["rev-parse", "HEAD"], {}, { quiet: true });
+  return stdout.trim();
+}
+
+async function buildRunnerImage(workerBaseUrl, environment) {
+  reportDeploymentPhase("Building and rolling out the runner image");
+  const setupValidationToken = generateWebhookSecret();
+  await putWorkerSecret("RUNNER_SETUP_VALIDATION_TOKEN", setupValidationToken, environment);
+  try {
+    const workflowId = await startRemoteRunnerImageBuild(workerBaseUrl, setupValidationToken);
+    const result = await waitForRemoteRunnerImageBuild(workerBaseUrl, setupValidationToken, workflowId, {
+      onProgress: (message) => console.log(message),
+    });
+    console.log(`Runner image: ${result?.built === false ? "reused" : "built"} (${result?.imageReference})`);
+  } finally {
+    await deleteWorkerSecret("RUNNER_SETUP_VALIDATION_TOKEN", environment);
   }
 }
 
@@ -778,6 +810,7 @@ async function generatedConfig(
   cacheConfiguration,
   runnerPoolGitHubOwner,
   ownershipManifest,
+  sourceCommit,
 ) {
   const [applications, builderBootstrap] = await Promise.all([
     currentApplications(environment),
@@ -811,6 +844,7 @@ async function generatedConfig(
     RUNNER_CACHE_MAX_BYTES: String(cacheConfiguration.maxBytes),
     RUNNER_CACHE_PREFIX: cacheConfiguration.prefix,
     RUNNER_IMAGE_BUILDER_BOOTSTRAP_DEPLOYMENT_ID: builderBootstrap.deploymentId,
+    RUNNER_IMAGE_SOURCE_REF: sourceCommit,
     RUNNER_INSTALLATION_ID: ownershipManifest.installationId,
     RUNNER_RESOURCE_MANIFEST: serializeRunnerOwnershipManifest(ownershipManifest),
   };
@@ -833,6 +867,8 @@ async function generatedConfig(
 
 export async function main(arguments_ = process.argv.slice(2)) {
   const dryRun = arguments_.includes("--dry-run");
+  const buildImage = arguments_.includes("--build-image");
+  const sourceCommit = await deployedCommit();
   const accountId = nonEmptyStringSchema.safeParse(process.env.CLOUDFLARE_ACCOUNT_ID);
   if (!accountId.success) {
     throw new Error("CLOUDFLARE_ACCOUNT_ID is required for an account-safe deployment");
@@ -966,6 +1002,7 @@ export async function main(arguments_ = process.argv.slice(2)) {
     cacheConfiguration,
     runnerPoolGitHubOwner,
     ownershipManifest,
+    sourceCommit,
   );
   try {
     console.log(
@@ -987,8 +1024,15 @@ export async function main(arguments_ = process.argv.slice(2)) {
       dryRun ? "Building the Worker deployment preview" : "Building, uploading, and deploying the Worker",
     );
     console.log(dryRun ? "Checking Worker deployment..." : "Deploying Worker...");
-    await runWrangler(args, environment);
+    const deployment = await runWrangler(args, environment);
     await retireLegacyRunnerImageSourceBucket(environment, storageBucket.name, { dryRun });
+    if (buildImage && !dryRun) {
+      const workerBaseUrl = extractWorkerBaseUrl(`${deployment.stdout}\n${deployment.stderr}`);
+      if (workerBaseUrl === undefined) {
+        throw new Error("Wrangler printed no workers.dev URL to build the runner image against");
+      }
+      await buildRunnerImage(workerBaseUrl, environment);
+    }
   } finally {
     await rm(generated.directory, { recursive: true, force: true });
   }

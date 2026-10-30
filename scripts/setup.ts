@@ -1292,7 +1292,7 @@ async function verifyWorker(workerBaseUrl) {
   }
 }
 
-async function putWorkerSecret(name, value, cloudflareEnvironment) {
+export async function putWorkerSecret(name, value, cloudflareEnvironment) {
   await runCommand(npxCommand, wranglerArguments(["secret", "put", name], cloudflareEnvironment.WRANGLER_PROFILE), {
     environment: cloudflareEnvironment,
     input: `${value}\n`,
@@ -1309,7 +1309,7 @@ async function putWorkerSecrets(values, cloudflareEnvironment) {
   });
 }
 
-async function deleteWorkerSecret(name, cloudflareEnvironment) {
+export async function deleteWorkerSecret(name, cloudflareEnvironment) {
   await runCommand(npxCommand, wranglerArguments(["secret", "delete", name], cloudflareEnvironment.WRANGLER_PROFILE), {
     environment: cloudflareEnvironment,
     input: "y\n",
@@ -1408,7 +1408,7 @@ async function recordWorkerResourceOwnership(workerBaseUrl, setupValidationToken
   return result.data;
 }
 
-async function startRemoteRunnerImageBuild(workerBaseUrl, setupValidationToken) {
+export async function startRemoteRunnerImageBuild(workerBaseUrl, setupValidationToken) {
   const response = await waitForWorkerSetupAuthorization(() =>
     fetch(`${workerBaseUrl}/v1/setup/runner-image/build`, {
       method: "POST",

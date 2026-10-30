@@ -48,9 +48,8 @@
     // Workflow re-verify the pinned private builder manifest after a deploy.
     "RUNNER_IMAGE_BUILDER_BOOTSTRAP_DEPLOYMENT_ID": "unconfigured",
     "RUNNER_IMAGE_NAME": "cloudflare-github-actions-runner-runner",
-    // Voltplot's fork, pinned to the tag on this commit: runner images build only from code we pushed.
+    // scripts/deploy.ts sets RUNNER_IMAGE_SOURCE_REF to the deployed commit, so the image builds from the code the Worker runs.
     "RUNNER_IMAGE_SOURCE_REPOSITORY": "voltplot/cloudflare-github-actions-runner",
-    "RUNNER_IMAGE_SOURCE_REF": "v1.0.10-voltplot.12",
     "RUNNER_CACHE_ENABLED": "true",
     "RUNNER_CACHE_MAX_BYTES": "100000000000",
     "RUNNER_CACHE_PREFIX": "cloudflare-github-actions-runner",

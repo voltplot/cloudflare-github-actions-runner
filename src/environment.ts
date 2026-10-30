@@ -26,6 +26,7 @@ export type WorkerEnvironment = Env &
   GitHubCredentialEnvironment &
   GitHubDynamicSecretEnvironment &
   WorkerSecrets & {
+    RUNNER_IMAGE_SOURCE_REF: string;
     RUNNER_INSTALLATION_ID: string;
     RUNNER_RESOURCE_MANIFEST: string;
   };

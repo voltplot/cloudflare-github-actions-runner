@@ -116,9 +116,14 @@ export async function deleteGitHubRunner(
   return { kind: "failed", status: response.status };
 }
 
-const githubJobSchema = z.object({ status: z.string() });
+const githubJobSchema = z.object({ status: z.string(), run_url: z.string() });
+const githubRunSchema = z.object({ status: z.string() });
 
-/** https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run */
+/**
+ * https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+ * GitHub can leave a job `queued` forever after its run completed; such a job
+ * counts as completed, or its demand would be requeued without end.
+ */
 export async function githubJobStatus(
   credentials: GitHubRunnerCredentials,
   jobId: string,
@@ -131,7 +136,15 @@ export async function githubJobStatus(
   if (!response.ok) {
     throw new Error(`GitHub returned HTTP ${response.status} for job ${jobId}`);
   }
-  return githubJobSchema.parse(await response.json()).status;
+  const job = githubJobSchema.parse(await response.json());
+  if (job.status !== "queued") {
+    return job.status;
+  }
+  const runResponse = await dependencies.fetch(job.run_url, { headers: githubHeaders(credentials.token) });
+  if (!runResponse.ok) {
+    throw new Error(`GitHub returned HTTP ${runResponse.status} for the run of job ${jobId}`);
+  }
+  return githubRunSchema.parse(await runResponse.json()).status === "completed" ? "completed" : job.status;
 }
 
 export async function provisionRunner(

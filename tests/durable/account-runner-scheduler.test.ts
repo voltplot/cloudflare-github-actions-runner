@@ -7,8 +7,18 @@ import { RUNNER_PROFILES } from "../../src/runner-profiles";
 const target = { owner: "biw", repository: "runner-poc" };
 const profile = RUNNER_PROFILES["standard-3"];
 
-const queuedGitHubResponse: typeof fetch = async (_input, init) =>
-  init?.method === "DELETE" ? new Response(null, { status: 204 }) : Response.json({ status: "queued" });
+const runUrl = "https://api.github.com/repos/biw/cloudflare-github-actions-runner/actions/runs/1";
+const queuedJobResponse =
+  (runStatus: string): typeof fetch =>
+  async (input, init) => {
+    if (init?.method === "DELETE") {
+      return new Response(null, { status: 204 });
+    }
+    return String(input) === runUrl
+      ? Response.json({ status: runStatus })
+      : Response.json({ status: "queued", run_url: runUrl });
+  };
+const queuedGitHubResponse = queuedJobResponse("in_progress");
 
 function job(jobId: string, runnerName: string, cacheScope: string): SchedulerJobInput {
   return {
@@ -181,6 +191,31 @@ describe("AccountRunnerScheduler stopped runners", () => {
     });
   });
 
+  it("ends a job GitHub still shows queued once its run has completed", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("ghost-queued-job");
+    const ghostJob = legacyJob("950");
+
+    await scheduler.submit(ghostJob);
+    await provisionRunner(scheduler, ghostJob, 9_501);
+    await runInDurableObject(scheduler, async (instance, state) => {
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedJobResponse("completed"));
+      try {
+        await instance.runnerStopped(ghostJob.runnerName, { exitCode: 0, reason: "exit" });
+        state.storage.sql.exec("UPDATE scheduler_jobs SET recovery_due_at = 0 WHERE job_id = ?", ghostJob.jobId);
+        await instance.alarm();
+      } finally {
+        fetch.mockRestore();
+      }
+      const [row] = state.storage.sql
+        .exec<{ status: string; runner_name: string }>(
+          "SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?",
+          ghostJob.jobId,
+        )
+        .toArray();
+      expect(row).toEqual({ status: "completed", runner_name: ghostJob.runnerName });
+    });
+  });
+
   it("deregisters only the runner whose Container stopped", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("stopped-runner-only");
     const sourceJob = legacyJob("1000");
@@ -195,7 +230,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     await runInDurableObject(scheduler, async (instance, state) => {
       const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
         if (init?.method !== "DELETE") {
-          return Response.json({ status: "completed" });
+          return Response.json({ status: "completed", run_url: runUrl });
         }
         deletes.push(String(input).split("/").at(-1) ?? "");
         if (deletes.length === 1) {
@@ -647,7 +682,7 @@ describe("AccountRunnerScheduler stopped runners", () => {
     const source = legacyJob("2150");
     await scheduler.submit(source);
     await runInDurableObject(scheduler, async (instance, state) => {
-      const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ status: "queued" }));
+      const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(queuedGitHubResponse);
       try {
         state.storage.sql.exec("UPDATE scheduler_jit_runners SET provisioning_deadline = 0");
         await instance.alarm();
